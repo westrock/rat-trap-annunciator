@@ -23,7 +23,7 @@ void handleNetworkTransition(bool makeAP);
 void resetHeartbeatTimer();
 void processTimeout();
 void startToneFor(uint8_t tonePin, unsigned int frequency1, unsigned int frequency2, unsigned long segmentDurationMs, unsigned long durationMs);
-void processAudio(uint8_t tonePin);
+void processAlertTone(uint8_t tonePin);
 void forceQuitTone(uint8_t tonePin);
 void handleAlertTripped();
 void handleAlertSet();
@@ -39,5 +39,7 @@ void clearTimeoutIndication();
 void dumpWiFiStatus(wl_status_t status);
 const char *currentStateToString(currentState_t state);
 const char *wifiStatusToString(wl_status_t status);
+bool parse_long(const char *str, long *result);
+void updateRssiStats(long rssi);
 
 #endif // MAIN_H

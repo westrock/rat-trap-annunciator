@@ -2,8 +2,9 @@
 #include <WiFiS3.h>
 #include <WiFiUdp.h>
 #include <ArduinoGraphics.h>
-#include <ArduinoMDNS.h>
+// #include <ArduinoMDNS.h>
 #include "Arduino_LED_Matrix.h" // Include the LED_Matrix library
+#include "limits.h"
 #include "animations.h"
 #include "main.h"
 #include "secrets.h"
@@ -13,6 +14,7 @@
 //--------------------------------------------------
 #define MAX_REQUEST_LINE 256
 #define MAX_STATE_LEN 16
+#define MAX_RSSI_LEN 8
 #define MAX_METHOD_LEN 8
 #define MAX_URI_LEN 128
 
@@ -25,8 +27,8 @@
 // const char *ap_pass = "**********";
 //--------------------------------------------------
 
-const int MODE_TEST_PIN = 7; // Pin that will set the level
-const int MODE_PIN = 8;
+const int WIFI_MODE_TEST_PIN = 7; // Pin that will set the level
+const int WIFI_MODE_PIN = 8;
 const int SPEAKER_PIN = 11;
 
 unsigned long lastNetworkCheck = 0;
@@ -40,13 +42,29 @@ const unsigned int TONE_A4 = 440;
 const unsigned int TONE_A5 = 880;
 const unsigned int TONE_A6 = 1760;
 
+const char *REASON_PHRASE_200_OK = "OK";
+const char *REASON_PHRASE_400_BadRequest = "Bad Request";
+const char *REASON_PHRASE_405_MethodNotAllowed = "Method Not Allowed";
+const char *REASON_PHRASE_408_RequestTimeout = "Request Timeout";
+const char *REASON_PHRASE_414_URITooLong = "URI Too Long";
+const char *REASON_PHRASE_500_InternalServerError = "Internal Server Error";
+const char *REASON_PHRASE_404_NotFound = "Not Found";
+
+const int RESPONSE_CODE_200 = 200;
+const int RESPONSE_CODE_400 = 400;
+const int RESPONSE_CODE_405 = 405;
+const int RESPONSE_CODE_408 = 408;
+const int RESPONSE_CODE_414 = 414;
+const int RESPONSE_CODE_500 = 500;
+const int RESPONSE_CODE_404 = 404;
+
 //--------------------------------------------------
 // GLOBALS
 //--------------------------------------------------
 
 ArduinoLEDMatrix matrix;
 WiFiUDP udp;
-MDNS mdns(udp);
+// MDNS mdns(udp);
 WiFiServer server(80);
 
 currentState_t currentState = NONE;
@@ -70,6 +88,10 @@ unsigned int toneFrequency2 = 0;
 unsigned long toneSegmentDuration = 0;
 unsigned long toneLastSegmentChange = 0;
 
+long rssiMin = LONG_MAX;
+long rssiMax = LONG_MIN;
+long rssiLatest = 0;
+
 bool tonePlayingFirstSegment = true;
 //--------------------------------------------------
 // SETUP
@@ -77,19 +99,26 @@ bool tonePlayingFirstSegment = true;
 void setup()
 {
     Serial.begin(115200);
-    while (!Serial);
-    
+
+    unsigned long startSerialTime = millis();
+    while (!Serial && millis() - startSerialTime < 2000)
+    {
+        delay(50);
+        digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+    }
+    digitalWrite(LED_BUILTIN, LOW);
+
     // Set pin 7 as output and Enable internal pull-up on pin 8 (INPUT_PULLUP)
-    pinMode(MODE_TEST_PIN, OUTPUT);
-    pinMode(MODE_PIN, INPUT_PULLUP);
+    pinMode(WIFI_MODE_TEST_PIN, OUTPUT);
+    pinMode(WIFI_MODE_PIN, INPUT_PULLUP);
 
     matrix.begin();
     matrix.loadSequence(STARTUP);
     matrix.play(true);
 
-    digitalWrite(MODE_TEST_PIN, LOW);
+    digitalWrite(WIFI_MODE_TEST_PIN, LOW);
     delay(5);
-    isAPMode = (digitalRead(MODE_PIN) == HIGH);
+    isAPMode = (digitalRead(WIFI_MODE_PIN) == HIGH);
 
     Serial.println("System Initializing...");
 
@@ -107,7 +136,7 @@ void loop()
     processNetworkHealth();
     processHttpRequests();
     processTimeout();
-    processAudio(SPEAKER_PIN);
+    processAlertTone(SPEAKER_PIN);
 }
 
 //--------------------------------------------------
@@ -118,7 +147,7 @@ void loop()
 //--------------------------------------------------
 void processNetworkHealth()
 {
-    mdns.run();
+    // mdns.run();
     if (millis() - lastNetworkCheck < NETWORK_CHECK_INTERVAL_MS)
     {
         return;
@@ -160,30 +189,28 @@ void processNetworkHealth()
 // The HTTP server handles incoming requests and routes them to the appropriate handler functions based on the URI.
 // It supports endpoints for status, alert, and other custom actions.
 //--------------------------------------------------
-bool getStateParameter(const char *uri,
-                       char *state,
-                       size_t stateSize)
+bool getStateParameter(const char *uri, char *key, char *value, size_t valueSize)
 {
-    const char *p = strstr(uri, "state=");
+    const char *keyValuePtr = strstr(uri, key);
 
-    if (p == NULL)
+    if (keyValuePtr == NULL)
     {
-        state[0] = '\0';
+        value[0] = '\0';
         return false;
     }
 
-    p += strlen("state=");
+    keyValuePtr += strlen(key);
 
     size_t i = 0;
 
-    while (*p &&
-           *p != '&' &&
-           i < stateSize - 1)
+    while (*keyValuePtr &&
+           *keyValuePtr != '&' &&
+           i < valueSize - 1)
     {
-        state[i++] = *p++;
+        value[i++] = *keyValuePtr++;
     }
 
-    state[i] = '\0';
+    value[i] = '\0';
 
     return true;
 }
@@ -201,8 +228,13 @@ bool getStateParameter(const char *uri,
 void processRequest(WiFiClient &client, const char *uri)
 {
     static char responseBuffer[512];
+    char clienIPAddress[16];
 
-    if (strncmp(uri, "/report", 7) == 0)
+                resetHeartbeatTimer();
+
+    strncpy(clienIPAddress, client.remoteIP().toString().c_str(), sizeof(clienIPAddress));
+
+    if (strncasecmp(uri, "/report", 7) == 0)
     {
         //--------------------------------------------------
         // REPORT
@@ -216,97 +248,90 @@ void processRequest(WiFiClient &client, const char *uri)
         // The handleServerError function is used to handle any errors that occur while preparing the HTTP response.
         // The resetHeartbeatTimer function WILL NOT reset the heartbeat timer after handling the report request.
         //--------------------------------------------------
-        int written = snprintf(responseBuffer, 
-            sizeof(responseBuffer), 
-            "Current State: %s\r\nIP Address: %s\r\nRemote IP Address: %s\r\nSignal strength (RSSI): %ld dBm", 
-            currentStateToString(currentState), 
-            WiFi.localIP().toString().c_str(),
-            client.remoteIP().toString().c_str(),
-            WiFi.RSSI());
+        int written = -1;
+        if (isAPMode)
+        {
+            written = snprintf(responseBuffer,
+                               sizeof(responseBuffer),
+                               "Current State: %s\r\nIP Address: %s\r\nSignal strength (RSSI): N.A.\r\nRemote IP Address: %s\r\nRemote (RSSI) current/min/max: %ld/%ld/%ld dBm",
+                               currentStateToString(currentState),
+                               WiFi.localIP().toString().c_str(),
+                               clienIPAddress,
+                               rssiLatest, rssiMin, rssiMax);
+        }
+        else
+        {
+            written = snprintf(responseBuffer,
+                               sizeof(responseBuffer),
+                               "Current State: %s\r\nIP Address: %s\r\nSignal strength (RSSI): %ld dBm\r\nRemote IP Address: %s\r\nRemote (RSSI) current/min/max: %ld/%ld/%ld dBm",
+                               currentStateToString(currentState),
+                               WiFi.localIP().toString().c_str(),
+                               WiFi.RSSI(),
+                               clienIPAddress,
+                               rssiLatest, rssiMin, rssiMax);
+        }
 
         if (written < 0 || written >= sizeof(responseBuffer))
         {
             handleServerError(client, "Unexpected buffer overflow preparing HTTP response.");
             return;
         }
-
-        sendHttpResponse(client, 200, "OK", responseBuffer);
-        client.stop();
+        Serial.println("HTTP REPORT request received. Sending response:");
+        Serial.println(responseBuffer);
+        sendHttpResponse(client, 200, REASON_PHRASE_200_OK, responseBuffer);
     }
     else
     {
         char state[MAX_STATE_LEN];
+        char rssi[MAX_RSSI_LEN];
 
-        if (!getStateParameter(uri,
-                               state,
-                               sizeof(state)))
+        if (!getStateParameter(uri, "state=", state, sizeof(state)))
         {
             Serial.print("Missing state parameter. URI: ");
             Serial.println(uri);
-            sendHttpResponse(client, 400, "Bad Request", "Missing Status/Alert State");
-            client.stop();
+            sendHttpResponse(client, 400, REASON_PHRASE_400_BadRequest, "Missing Status/Alert State");
             return;
         }
 
-        if (strncmp(uri, "/status", 7) == 0)
+        getStateParameter(uri, "rssi=", rssi, sizeof(rssi));
+
+        if (strlen(rssi) > 0)
         {
-            //--------------------------------------------------
-            // STATUS
-            //--------------------------------------------------
-            if (strcmp(state, "tripped") == 0)
+            long rssiValue;
+            if (parse_long(rssi, &rssiValue))
             {
-                handleStatusTripped();
-                resetHeartbeatTimer();
-
-                sendHttpResponse(client, 200, "OK", "Status Tripped OK");
-                client.stop();
-            }
-            else if (strcmp(state, "set") == 0)
-            {
-                handleStatusSet();
-                resetHeartbeatTimer();
-
-                sendHttpResponse(client, 200, "OK", "Status Set OK");
-                client.stop();
+                updateRssiStats(rssiValue);
             }
             else
             {
-                Serial.println("Invalid STATUS state");
-
-                sendHttpResponse(client, 400, "Bad Request", "Invalid Status State");
-                client.stop();
+                Serial.print("Invalid RSSI value: ");
+                Serial.println(rssi);
             }
         }
-        else if (strncmp(uri, "/alert", 6) == 0)
+
+        currentState_t theState = (strcasecmp(state, "tripped") == 0) ? TRIPPED : (strcasecmp(state, "set") == 0 ? SET : NONE);
+        bool isStatus = strncasecmp(uri, "/status", 7) == 0;
+        bool isAlert = strncasecmp(uri, "/alert", 6) == 0;
+
+        if (isStatus || isAlert)
         {
-            //--------------------------------------------------
-            // ALERT
-            //--------------------------------------------------
-
-            if (strcmp(state, "tripped") == 0)
+            switch (theState)
             {
-                handleAlertTripped();
-                resetHeartbeatTimer();
-
-                sendHttpResponse(client, 200, "OK", "Alert Tripped OK");
-                client.stop();
+            case TRIPPED:
+                handleStatusTripped();
+                sendHttpResponse(client, RESPONSE_CODE_200, REASON_PHRASE_200_OK, isStatus ? "Status Tripped OK" : "Alert Tripped OK");
+                break;
+            case SET:
+                handleStatusSet();
+                sendHttpResponse(client, RESPONSE_CODE_200, REASON_PHRASE_200_OK, isStatus ?" Status Set OK" : "Alert Set OK");
+                break;
+            case NONE:
+            default:
+                Serial.println(isStatus ? "Invalid Status State" : "Invalid Alert State");
+                sendHttpResponse(client, RESPONSE_CODE_400, REASON_PHRASE_400_BadRequest, isStatus ? "Invalid Status State" : "Invalid Alert State");
+                break;
             }
-            else if (strcmp(state, "set") == 0)
-            {
-                handleAlertSet();
-                resetHeartbeatTimer();
-
-                sendHttpResponse(client, 200, "OK", "Alert Set OK");
-                client.stop();
-            }
-            else
-            {
-                Serial.println("Invalid ALERT state");
-
-                sendHttpResponse(client, 400, "Bad Request", "Invalid Alert State");
-                client.stop();
-            }
-        } 
+        }
         else
         {
             //--------------------------------------------------
@@ -316,8 +341,7 @@ void processRequest(WiFiClient &client, const char *uri)
             Serial.print("Unknown URI: ");
             Serial.println(uri);
 
-            sendHttpResponse(client, 404, "Not Found", "Unknown URI");
-            client.stop();
+            sendHttpResponse(client, RESPONSE_CODE_404, REASON_PHRASE_404_NotFound, "Unknown URI");
         }
     }
 }
@@ -340,16 +364,34 @@ void processHttpRequests()
     // Configure socket timeout
     //--------------------------------------------------
 
-    client.setTimeout(250);
 
     //--------------------------------------------------
     // Read first request line
     //--------------------------------------------------
 
+    client.setTimeout(1000);
+
+    unsigned long startTime = millis();
+
+    while (!client.available())
+    {
+        if (millis() - startTime > 1000)
+        {
+            Serial.println("Client data timeout");
+            client.stop();
+            return;
+        }
+
+        delay(1);
+    }
+
     char requestLine[MAX_REQUEST_LINE];
 
-    size_t len = client.readBytesUntil('\n', requestLine, sizeof(requestLine) - 1);
-
+    size_t len = client.readBytesUntil(
+        '\n',
+        requestLine,
+        sizeof(requestLine) - 1);
+        
     requestLine[len] = '\0';
 
     //--------------------------------------------------
@@ -370,8 +412,7 @@ void processHttpRequests()
     if (len == 0)
     {
         Serial.println("HTTP request timeout");
-        sendHttpResponse(client, 408, "Request Timeout", "Request Timeout");
-        client.stop();
+        sendHttpResponse(client, RESPONSE_CODE_408, REASON_PHRASE_408_RequestTimeout, "Request Timeout");
 
         return;
     }
@@ -383,8 +424,7 @@ void processHttpRequests()
     if (len >= sizeof(requestLine) - 1)
     {
         Serial.println("HTTP request line too long");
-        sendHttpResponse(client, 414, "URI Too Long", "URI Too Long");
-        client.stop();
+        sendHttpResponse(client, RESPONSE_CODE_414, REASON_PHRASE_414_URITooLong, "URI Too Long");
     
         return;
     }
@@ -401,8 +441,7 @@ void processHttpRequests()
     if (fields != 2)
     {
         Serial.println("Malformed HTTP request");
-        sendHttpResponse(client, 400, "Bad Request", "Malformed request");
-        client.stop();
+        sendHttpResponse(client, RESPONSE_CODE_400, REASON_PHRASE_400_BadRequest, "Malformed request");
 
         return;
     }
@@ -411,14 +450,13 @@ void processHttpRequests()
     // Verify HTTP method
     //--------------------------------------------------
 
-    if (strcmp(method, "GET") != 0)
+    if (strcasecmp(method, "GET") != 0)
     {
         Serial.print("Unsupported method: ");
         Serial.println(method);
 
-        sendHttpResponse(client, 405, "Method Not Allowed", "HTTP method not supported");
-        client.stop();
-
+        sendHttpResponse(client, RESPONSE_CODE_405, REASON_PHRASE_405_MethodNotAllowed, "HTTP method not supported");
+ 
         return;
     }
 
@@ -426,10 +464,9 @@ void processHttpRequests()
     // Ignore browser favicon requests
     //--------------------------------------------------
 
-    if (strncmp(uri, "/favicon.ico", 12) == 0)
+    if (strncasecmp(uri, "/favicon.ico", 12) == 0)
     {
-        sendHttpResponse(client, 404, "Not Found", "Not Found");
-        client.stop();
+        sendHttpResponse(client, RESPONSE_CODE_404, REASON_PHRASE_404_NotFound, "Not Found");
         return;
     }
 
@@ -438,6 +475,13 @@ void processHttpRequests()
     //--------------------------------------------------
 
     processRequest(client, uri);
+
+    if (client.connected())
+    {
+        client.flush();
+        delay(10);
+        client.stop();
+    }
 }
 
 //--------------------------------------------------
@@ -446,7 +490,7 @@ void processHttpRequests()
 //--------------------------------------------------
 void handleServerError(WiFiClient &client, const char *message)
 {
-    sendHttpResponse(client, 500, "Internal Server Error", message);
+    sendHttpResponse(client, RESPONSE_CODE_500, REASON_PHRASE_500_InternalServerError, message);
 }
 
 //--------------------------------------------------
@@ -455,7 +499,7 @@ void handleServerError(WiFiClient &client, const char *message)
 //--------------------------------------------------
 void sendHttpResponse(WiFiClient &client, int statusCode, const char *reasonPhrase, const char *message)
 {
-    static char responseBuffer[256];
+    static char responseBuffer[1024];
 
     int written = snprintf(responseBuffer, sizeof(responseBuffer), "HTTP/1.1 %d %s", statusCode, reasonPhrase);
 
@@ -480,6 +524,9 @@ void sendHttpResponse(WiFiClient &client, int statusCode, const char *reasonPhra
     {
         client.print(message);
     }
+    client.flush();
+    delay(10);
+    client.stop();
 }
 
 //--------------------------------------------------
@@ -493,6 +540,12 @@ void sendHttpResponse(WiFiClient &client, int statusCode, const char *reasonPhra
 void handleNetworkTransition(bool makeAP)
 {
     Serial.println("\n--- Setting Network Mode ---");
+
+    // 1. Cleanup existing state to prevent memory leaks and conflicts
+    WiFi.disconnect();
+    // server.stop(); // If your server library supports a stop method
+
+    networkInitialized = false;
 
     if (makeAP)
     {
@@ -517,39 +570,32 @@ void handleNetworkTransition(bool makeAP)
         Serial.print("IP: ");
         Serial.println(WiFi.localIP());
 
-        // if (WiFi.beginAP(ap_ssid, ap_pass) == WL_CONNECTED)
         if (status == WL_AP_LISTENING || status == WL_AP_CONNECTED)
         {
             Serial.print("AP established. IP address: ");
             Serial.println(WiFi.localIP());
 
             server.begin();
-            Serial.println("Starting mDNS...");
-            bool ok = mdns.begin(WiFi.localIP(), "ratdetector");
-            Serial.println(ok ? "mDNS OK" : "mDNS FAIL");
 
-            //isAPMode = true;
             networkInitialized = true;
         }
         else
         {
             Serial.println("Error: Failed to establish Access Point.");
-            networkInitialized = false;
         }
     }
     else
     {
-        Serial.println("Mode: Station (STA)");
-        Serial.print("Connecting to ");
+        Serial.print("Mode: Station (STA) - Connecting to ");
         Serial.println(sta_ssid);
 
         if (WiFi.begin(sta_ssid, sta_pass))
         {
             // Wait for connection (with timeout)
             int attempts = 0;
-            while (WiFi.status() != WL_CONNECTED && attempts < 20)
+            while (WiFi.status() != WL_CONNECTED && attempts < 200)
             {
-                delay(500);
+                delay(50);
                 Serial.print(".");
                 attempts++;
             }
@@ -559,7 +605,7 @@ void handleNetworkTransition(bool makeAP)
                 IPAddress ip;
                 bool haveValidIP = false;
 
-                for (int i = 0; i < 20; i++)
+                for (int i = 0; i < 200; i++)
                 {
                     ip = WiFi.localIP();
 
@@ -568,9 +614,9 @@ void handleNetworkTransition(bool makeAP)
                         haveValidIP = true;
                         break;
                     }
-
-                    delay(500);
+                    delay(50);
                 }
+
                 if (haveValidIP)
                 {
                     Serial.println("\nConnected successfully!");
@@ -584,29 +630,96 @@ void handleNetworkTransition(bool makeAP)
                     Serial.println(" dBm");
                 
                     server.begin();
-                    Serial.println("Starting mDNS...");
-                    bool ok = mdns.begin(WiFi.localIP(), "ratdetector");
-                    Serial.println(ok ? "mDNS OK" : "mDNS FAIL");
 
-                    //isAPMode = false;
                     networkInitialized = true;
                 }
                 else
                 {
                     Serial.println("\nError: Failed to obtain a valid IP address.");
-                    networkInitialized = false;
                 }
             }
             else
             {
                 Serial.println("\nError: Failed to connect to WiFi.");
-                networkInitialized = false;
             }
         }
         else
         {
             Serial.println("Error: WiFi hardware not responding.");
-            networkInitialized = false;
+        }
+    }
+}
+
+void handleNetworkTransition_new(bool makeAP)
+{
+    Serial.println("\n--- Transitioning Network Mode ---");
+
+    // 1. Cleanup existing state to prevent memory leaks and conflicts
+    WiFi.disconnect();
+    // server.stop(); // If your server library supports a stop method
+
+    networkInitialized = false;
+
+    if (makeAP)
+    {
+        Serial.println("Mode: Access Point (AP)");
+        if (WiFi.beginAP(ap_ssid, ap_pass) != 0)
+        {
+            Serial.println("Error: beginAP failed to initialize hardware.");
+            return;
+        }
+
+        // Poll for AP status instead of hard delay
+        int attempts = 0;
+        while (WiFi.status() != WL_AP_LISTENING && attempts < 20)
+        {
+            delay(200);
+            attempts++;
+        }
+
+        if (WiFi.status() == WL_AP_LISTENING)
+        {
+            Serial.print("AP established. IP: ");
+            Serial.println(WiFi.localIP());
+            networkInitialized = true;
+        }
+        else
+        {
+            Serial.println("Error: Failed to establish Access Point.");
+        }
+    }
+    else
+    {
+        Serial.print("Mode: Station (STA) - Connecting to ");
+        Serial.println(sta_ssid);
+
+        if (WiFi.begin(sta_ssid, sta_pass))
+        {
+            int attempts = 0;
+            while (WiFi.status() != WL_CONNECTED && attempts < 20)
+            {
+                delay(500);
+                Serial.print(".");
+                attempts++;
+            }
+
+            if (WiFi.status() == WL_CONNECTED)
+            {
+                Serial.println("\nConnected successfully!");
+                Serial.print("IP Address: ");
+                Serial.println(WiFi.localIP());
+                Serial.print("RSSI: ");
+                Serial.println(WiFi.RSSI());
+                networkInitialized = true;
+            }
+            else
+            {
+                Serial.println("\nError: Connection timeout.");
+            }
+        }
+        else
+        {
+            Serial.println("Error: WiFi hardware not responding.");
         }
     }
 }
@@ -652,7 +765,7 @@ void processTimeout()
 //--------------------------------------------------
 // AUDIO MANAGEMENT
 // The startToneFor function initiates a tone sequence on the specified pin with the given frequencies and durations.
-// The processAudio function handles the progression of the tone sequence, switching between segments and stopping the tone when the total duration is reached.
+// The processAlertTone function handles the progression of the tone sequence, switching between segments and stopping the tone when the total duration is reached.
 //--------------------------------------------------
 void startToneFor(uint8_t tonePin, unsigned int frequency1, unsigned int frequency2, unsigned long segmentDurationMs, unsigned long durationMs)
 {
@@ -667,15 +780,6 @@ void startToneFor(uint8_t tonePin, unsigned int frequency1, unsigned int frequen
 
     tonePlayingFirstSegment = true;
     alertToneActive = true;
-
-    Serial.print("Speaker ON. F1=");
-    Serial.print(frequency1);
-    Serial.print(" F2=");
-    Serial.print(frequency2);
-    Serial.print(" Segment=");
-    Serial.print(segmentDurationMs);
-    Serial.print(" Total=");
-    Serial.println(durationMs);
 
     if (frequency1 > 0)
     {
@@ -692,10 +796,12 @@ void startToneFor(uint8_t tonePin, unsigned int frequency1, unsigned int frequen
 // The processAudio function is responsible for managing the audio output, including switching between tone segments and stopping the tone when the total duration is reached.
 // It should be called regularly in the main loop to ensure the audio sequence progresses correctly.
 //--------------------------------------------------
-void processAudio(uint8_t tonePin)
+void processAlertTone(uint8_t tonePin)
 {
     if (!alertToneActive)
     {
+        // If additional audio types are added in the future, handle them here.
+        // For now, just return.
         return;
     }
 
@@ -714,12 +820,13 @@ void processAudio(uint8_t tonePin)
     //--------------------------------------------------
     // Time to switch segments?
     //--------------------------------------------------
-    if (now - toneLastSegmentChange >= toneSegmentDuration)
+    if (toneSegmentDuration > 0 && now - toneLastSegmentChange >= toneSegmentDuration)
     {
         toneLastSegmentChange = now;
 
         tonePlayingFirstSegment = !tonePlayingFirstSegment;
 
+        // If both toneFrequency1 and toneFrequency2 are zero, noTone will be called in both segments.
         if (tonePlayingFirstSegment)
         {
             if (toneFrequency1 > 0)
@@ -1085,4 +1192,56 @@ void dumpWiFiStatus(wl_status_t status)
     Serial.print(" (");
     Serial.print(wifiStatusToString(status));
     Serial.println(")");
+}
+
+void updateRssiStats(long rssi)
+{
+    rssiLatest = rssi;
+
+    if (rssi < rssiMin)
+    {
+        rssiMin = rssi;
+    }
+    else
+    {
+        if (rssi > rssiMax)
+        {
+            rssiMax = rssi;
+        }
+    }
+}
+
+bool parse_long(const char *str, long *result)
+{
+    char *endptr;
+
+    // Check for empty string
+    if (!str || *str == '\0')
+    {
+        return false;
+    }
+
+    errno = 0;
+    *result = strtol(str, &endptr, 10);
+
+    // Check for conversion errors
+    if (errno == ERANGE)
+    {
+        return false; // Overflow or underflow
+    }
+
+    // Check if any conversion occurred
+    if (endptr == str)
+    {
+        return false; // No digits found
+    }
+
+    // Check for trailing garbage (only allow whitespace/null after number)
+    // Note: *endptr == '\0' ensures no trailing letters/digits
+    if (*endptr != '\0')
+    {
+        return false; // Trailing garbage found
+    }
+
+    return true;
 }
