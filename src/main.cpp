@@ -31,7 +31,6 @@ const int WIFI_MODE_TEST_PIN = 7; // Pin that will set the level
 const int WIFI_MODE_PIN = 8;
 const int SPEAKER_PIN = 11;
 
-unsigned long lastNetworkCheck = 0;
 const unsigned long NETWORK_CHECK_INTERVAL_MS = 10000UL;
 const unsigned long HEARTBEAT_TIMEOUT_MS      = 450000UL;   // 7.5 minutes
 const unsigned long ALERT_TONE_MS             = 60000UL;    // 60 sec
@@ -67,7 +66,8 @@ WiFiUDP g_udp;
 // MDNS mdns(g_udp);
 WiFiServer g_server(80);
 
-currentState_t currentState = NONE;
+CurrentState g_last_reported_trap_state = NONE;
+unsigned long g_last_network_check_time = 0;
 
 bool g_is_AP_mode = false;
 bool g_is_network_initialized = false;
@@ -123,7 +123,7 @@ void setup()
 
     Serial.println("System Initializing...");
 
-    handle_network_transition(g_is_AP_mode);
+    handleNetworkTransition(g_is_AP_mode);
     g_last_update_millis = millis();
 }
 
@@ -134,32 +134,32 @@ void setup()
 
 void loop()
 {
-    process_network_health();
-    process_http_requests();
-    process_timeout();
-    process_alert_tone(SPEAKER_PIN);
+    processNetworkHealth();
+    processHttpRequests();
+    processTimeout();
+    processAlertTone(SPEAKER_PIN);
 }
 
 //--------------------------------------------------
 // NETWORK HEALTH
-// The process_network_health function is responsible for monitoring the network status and handling any necessary transitions between AP and STA modes.
+// The processNetworkHealth function is responsible for monitoring the network status and handling any necessary transitions between AP and STA modes.
 // It periodically checks the network status and triggers appropriate actions if the network is not functioning correctly.
 // This function should be called regularly in the main loop to ensure the network health is continuously monitored.
 //--------------------------------------------------
-void process_network_health()
+void processNetworkHealth()
 {
     // mdns.run();
-    if (millis() - lastNetworkCheck < NETWORK_CHECK_INTERVAL_MS)
+    if (millis() - g_last_network_check_time < NETWORK_CHECK_INTERVAL_MS)
     {
         return;
     }
 
-    lastNetworkCheck = millis();
+    g_last_network_check_time = millis();
 
     if (!g_is_network_initialized)
     {
         Serial.println("Network not initialized. Retrying...");
-        handle_network_transition(g_is_AP_mode);
+        handleNetworkTransition(g_is_AP_mode);
         return;
     }
 
@@ -169,10 +169,10 @@ void process_network_health()
         if (status != WL_AP_LISTENING && status != WL_AP_CONNECTED)
         {
             Serial.print("AP ");
-            dump_wifi_status((wl_status_t)status);
+            dumpWifiStatus((wl_status_t)status);
 
             Serial.println("AP lost. Restarting...");
-            handle_network_transition(true);
+            handleNetworkTransition(true);
         }
     }
     else
@@ -180,35 +180,39 @@ void process_network_health()
         if (status != WL_CONNECTED)
         {
             Serial.println("STA disconnected. Reconnecting...");
-            handle_network_transition(false);
+            handleNetworkTransition(false);
         }
     }
 }
 
 //--------------------------------------------------
 // HTTP SERVER
-// The HTTP server handles incoming requests and routes them to the appropriate handler functions based on the URI.
-// It supports endpoints for status, alert, and other custom actions.
+// The HTTP server handles incoming resource requests and routes them to the appropriate handler functions based on the URI's resource.
+// It supports endpoints with the resources status, alert, report, and other custom actions to be defined.
 //--------------------------------------------------
-bool get_state_parameter(const char *uri, char *key, char *value, size_t valueSize)
-{
-    const char *keyValuePtr = strstr(uri, key);
 
-    if (keyValuePtr == NULL)
+//--------------------------------------------------
+// 
+//--------------------------------------------------
+bool getResourceParameter(const char *uri, char *key, char *value, size_t value_size)
+{
+    const char *key_value_ptr = strstr(uri, key);
+
+    if (key_value_ptr == NULL)
     {
         value[0] = '\0';
         return false;
     }
 
-    keyValuePtr += strlen(key);
+    key_value_ptr += strlen(key);
 
     size_t i = 0;
 
-    while (*keyValuePtr &&
-           *keyValuePtr != '&' &&
-           i < valueSize - 1)
+    while (*key_value_ptr &&
+           *key_value_ptr != '&' &&
+           i < value_size - 1)
     {
-        value[i++] = *keyValuePtr++;
+        value[i++] = *key_value_ptr++;
     }
 
     value[i] = '\0';
@@ -218,22 +222,22 @@ bool get_state_parameter(const char *uri, char *key, char *value, size_t valueSi
 
 //--------------------------------------------------
 // REQUEST PROCESSING
-// The process_request_uri function is responsible for handling the incoming HTTP requests and routing them to the appropriate handler functions based on the URI and state parameter.
-// The get_state_parameter function is used to extract the state parameter from the URI string. It returns true if the state parameter is found and false otherwise.
+// The processRequestURI function is responsible for handling the incoming HTTP requests and routing them to the appropriate handler functions based on the URI and state parameter.
+// The getResourceParameter function is used to extract the state parameter from the URI string. It returns true if the state parameter is found and false otherwise.
 // The MAX_STATE_LEN constant defines the maximum length of the state parameter that can be extracted from the URI.
-// The process_request_uri function should be called for each incoming HTTP request to ensure proper routing and handling of the request.
-// The get_state_parameter function should be used within process_request_uri to extract the state parameter from the URI before routing the request to the appropriate handler.
-// The HTTP server should be configured to call process_request_uri for each incoming request to ensure proper handling and routing.
+// The processRequestURI function should be called for each incoming HTTP request to ensure proper routing and handling of the request.
+// The getResourceParameter function should be used within processRequestURI to extract the state parameter from the URI before routing the request to the appropriate handler.
+// The HTTP server should be configured to call processRequestURI for each incoming request to ensure proper handling and routing.
 //--------------------------------------------------
 
-void process_request_uri(WiFiClient &client, const char *uri)
+void processRequestURI(WiFiClient &client, const char *uri)
 {
-    static char responseBuffer[512];
-    char clienIPAddress[16];
+    static char response_buffer[512];
+    char client_IP_address[16];
 
-                reset_heartbeat_timer();
+                resetHeartbeatTimer();
 
-    strncpy(clienIPAddress, client.remoteIP().toString().c_str(), sizeof(clienIPAddress));
+    strncpy(client_IP_address, client.remoteIP().toString().c_str(), sizeof(client_IP_address));
 
     if (strncasecmp(uri, "/report", 7) == 0)
     {
@@ -241,67 +245,67 @@ void process_request_uri(WiFiClient &client, const char *uri)
         // REPORT
         // The report endpoint provides the current state of the system.
         // The response includes the current state as a string.
-        // The currentState variable holds the current state of the system, which is then converted to a string for the response.
+        // The g_last_reported_trap_state variable holds the current state of the system, which is then converted to a string for the response.
         // The currentStateText variable holds the string representation of the current state, which is then used to construct the HTTP response.
-        // The responseBuffer variable holds the complete HTTP response, including the current state, which is then sent to the client.
-        // The send_http_response function is used to send the HTTP response to the client.
+        // The response_buffer variable holds the complete HTTP response, including the current state, which is then sent to the client.
+        // The sendHttpResponse function is used to send the HTTP response to the client.
         // The client.stop function is used to close the connection to the client after sending the response.
-        // The handle_server_error function is used to handle any errors that occur while preparing the HTTP response.
-        // The reset_heartbeat_timer function WILL NOT reset the heartbeat timer after handling the report request.
+        // The handleServerError function is used to handle any errors that occur while preparing the HTTP response.
+        // The resetHeartbeatTimer function WILL NOT reset the heartbeat timer after handling the report request.
         //--------------------------------------------------
         int written = -1;
         if (g_is_AP_mode)
         {
-            written = snprintf(responseBuffer,
-                               sizeof(responseBuffer),
+            written = snprintf(response_buffer,
+                               sizeof(response_buffer),
                                "Current State: %s\r\nIP Address: %s\r\nSignal strength (RSSI): N.A.\r\nRemote IP Address: %s\r\nRemote (RSSI) current/min/max: %ld/%ld/%ld dBm",
-                               current_state_to_string(currentState),
+                               currentTrapStateToString(g_last_reported_trap_state),
                                WiFi.localIP().toString().c_str(),
-                               clienIPAddress,
+                               client_IP_address,
                                g_rssi_latest, g_rssi_min, g_rssi_max);
         }
         else
         {
-            written = snprintf(responseBuffer,
-                               sizeof(responseBuffer),
+            written = snprintf(response_buffer,
+                               sizeof(response_buffer),
                                "Current State: %s\r\nIP Address: %s\r\nSignal strength (RSSI): %ld dBm\r\nRemote IP Address: %s\r\nRemote (RSSI) current/min/max: %ld/%ld/%ld dBm",
-                               current_state_to_string(currentState),
+                               currentTrapStateToString(g_last_reported_trap_state),
                                WiFi.localIP().toString().c_str(),
                                WiFi.RSSI(),
-                               clienIPAddress,
+                               client_IP_address,
                                g_rssi_latest, g_rssi_min, g_rssi_max);
         }
 
-        if (written < 0 || written >= sizeof(responseBuffer))
+        if (written < 0 || written >= sizeof(response_buffer))
         {
-            handle_server_error(client, "Unexpected buffer overflow preparing HTTP response.");
+            handleServerError(client, "Unexpected buffer overflow preparing HTTP response.");
             return;
         }
         Serial.println("HTTP REPORT request received. Sending response:");
-        Serial.println(responseBuffer);
-        send_http_response(client, 200, REASON_PHRASE_200_OK, responseBuffer);
+        Serial.println(response_buffer);
+        sendHttpResponse(client, 200, REASON_PHRASE_200_OK, response_buffer);
     }
     else
     {
         char state[MAX_STATE_LEN];
         char rssi[MAX_RSSI_LEN];
 
-        if (!get_state_parameter(uri, "state=", state, sizeof(state)))
+        if (!getResourceParameter(uri, "state=", state, sizeof(state)))
         {
             Serial.print("Missing state parameter. URI: ");
             Serial.println(uri);
-            send_http_response(client, 400, REASON_PHRASE_400_BadRequest, "Missing Status/Alert State");
+            sendHttpResponse(client, 400, REASON_PHRASE_400_BadRequest, "Missing Status/Alert State");
             return;
         }
 
-        get_state_parameter(uri, "rssi=", rssi, sizeof(rssi));
+        getResourceParameter(uri, "rssi=", rssi, sizeof(rssi));
 
         if (strlen(rssi) > 0)
         {
             long rssiValue;
-            if (parse_long(rssi, &rssiValue))
+            if (parseLong(rssi, &rssiValue))
             {
-                update_rssi_stats(rssiValue);
+                updateRssiStats(rssiValue);
             }
             else
             {
@@ -310,26 +314,26 @@ void process_request_uri(WiFiClient &client, const char *uri)
             }
         }
 
-        currentState_t theState = (strcasecmp(state, "tripped") == 0) ? TRIPPED : (strcasecmp(state, "set") == 0 ? SET : NONE);
-        bool isStatus = strncasecmp(uri, "/status", 7) == 0;
-        bool isAlert = strncasecmp(uri, "/alert", 6) == 0;
+        CurrentState the_incoming_state = (strcasecmp(state, "tripped") == 0) ? TRIPPED : (strcasecmp(state, "set") == 0 ? SET : NONE);
+        bool resource_is_status = strncasecmp(uri, "/status", 7) == 0;
+        bool resource_is_alert = strncasecmp(uri, "/alert", 6) == 0;
 
-        if (isStatus || isAlert)
+        if (resource_is_status || resource_is_alert)
         {
-            switch (theState)
+            switch (the_incoming_state)
             {
             case TRIPPED:
-                handle_status_tripped();
-                send_http_response(client, RESPONSE_CODE_200, REASON_PHRASE_200_OK, isStatus ? "Status Tripped OK" : "Alert Tripped OK");
+                handleStatusTripped();
+                sendHttpResponse(client, RESPONSE_CODE_200, REASON_PHRASE_200_OK, resource_is_status ? "Status Tripped OK" : "Alert Tripped OK");
                 break;
             case SET:
-                handle_status_set();
-                send_http_response(client, RESPONSE_CODE_200, REASON_PHRASE_200_OK, isStatus ?" Status Set OK" : "Alert Set OK");
+                handleStatusSet();
+                sendHttpResponse(client, RESPONSE_CODE_200, REASON_PHRASE_200_OK, resource_is_status ?" Status Set OK" : "Alert Set OK");
                 break;
             case NONE:
             default:
-                Serial.println(isStatus ? "Invalid Status State" : "Invalid Alert State");
-                send_http_response(client, RESPONSE_CODE_400, REASON_PHRASE_400_BadRequest, isStatus ? "Invalid Status State" : "Invalid Alert State");
+                Serial.println(resource_is_status ? "Invalid Status State" : "Invalid Alert State");
+                sendHttpResponse(client, RESPONSE_CODE_400, REASON_PHRASE_400_BadRequest, resource_is_status ? "Invalid Status State" : "Invalid Alert State");
                 break;
             }
         }
@@ -342,17 +346,17 @@ void process_request_uri(WiFiClient &client, const char *uri)
             Serial.print("Unknown URI: ");
             Serial.println(uri);
 
-            send_http_response(client, RESPONSE_CODE_404, REASON_PHRASE_404_NotFound, "Unknown URI");
+            sendHttpResponse(client, RESPONSE_CODE_404, REASON_PHRASE_404_NotFound, "Unknown URI");
         }
     }
 }
 
 //--------------------------------------------------
 // HTTP REQUEST HANDLING
-// The process_http_requests function is responsible for handling incoming HTTP requests, parsing the request line, and routing the request
+// The processHttpRequests function is responsible for handling incoming HTTP requests, parsing the request line, and routing the request
 // to the appropriate handler function.
 //--------------------------------------------------
-void process_http_requests()
+void processHttpRequests()
 {
     WiFiClient client = g_server.available();
 
@@ -372,11 +376,11 @@ void process_http_requests()
 
     client.setTimeout(1000);
 
-    unsigned long startTime = millis();
+    unsigned long timer_start_millis = millis();
 
     while (!client.available())
     {
-        if (millis() - startTime > 1000)
+        if (millis() - timer_start_millis > 1000)
         {
             Serial.println("Client data timeout");
             client.stop();
@@ -386,23 +390,23 @@ void process_http_requests()
         delay(1);
     }
 
-    char requestLine[MAX_REQUEST_LINE];
+    char request_line[MAX_REQUEST_LINE];
 
     size_t len = client.readBytesUntil(
         '\n',
-        requestLine,
-        sizeof(requestLine) - 1);
+        request_line,
+        sizeof(request_line) - 1);
         
-    requestLine[len] = '\0';
+    request_line[len] = '\0';
 
     //--------------------------------------------------
     // Trim trailing CR if present
     //--------------------------------------------------
 
     if (len > 0 &&
-        requestLine[len - 1] == '\r')
+        request_line[len - 1] == '\r')
     {
-        requestLine[len - 1] = '\0';
+        request_line[len - 1] = '\0';
         --len;
     }
 
@@ -413,7 +417,7 @@ void process_http_requests()
     if (len == 0)
     {
         Serial.println("HTTP request timeout");
-        send_http_response(client, RESPONSE_CODE_408, REASON_PHRASE_408_RequestTimeout, "Request Timeout");
+        sendHttpResponse(client, RESPONSE_CODE_408, REASON_PHRASE_408_RequestTimeout, "Request Timeout");
 
         return;
     }
@@ -422,10 +426,10 @@ void process_http_requests()
     // Detect possible truncation
     //--------------------------------------------------
 
-    if (len >= sizeof(requestLine) - 1)
+    if (len >= sizeof(request_line) - 1)
     {
         Serial.println("HTTP request line too long");
-        send_http_response(client, RESPONSE_CODE_414, REASON_PHRASE_414_URITooLong, "URI Too Long");
+        sendHttpResponse(client, RESPONSE_CODE_414, REASON_PHRASE_414_URITooLong, "URI Too Long");
     
         return;
     }
@@ -437,12 +441,12 @@ void process_http_requests()
     char method[MAX_METHOD_LEN];
     char uri[MAX_URI_LEN];
 
-    int fields = sscanf(requestLine, "%7s %127s", method, uri);
+    int fields = sscanf(request_line, "%7s %127s", method, uri);
 
     if (fields != 2)
     {
         Serial.println("Malformed HTTP request");
-        send_http_response(client, RESPONSE_CODE_400, REASON_PHRASE_400_BadRequest, "Malformed request");
+        sendHttpResponse(client, RESPONSE_CODE_400, REASON_PHRASE_400_BadRequest, "Malformed request");
 
         return;
     }
@@ -456,7 +460,7 @@ void process_http_requests()
         Serial.print("Unsupported method: ");
         Serial.println(method);
 
-        send_http_response(client, RESPONSE_CODE_405, REASON_PHRASE_405_MethodNotAllowed, "HTTP method not supported");
+        sendHttpResponse(client, RESPONSE_CODE_405, REASON_PHRASE_405_MethodNotAllowed, "HTTP method not supported");
  
         return;
     }
@@ -467,7 +471,7 @@ void process_http_requests()
 
     if (strncasecmp(uri, "/favicon.ico", 12) == 0)
     {
-        send_http_response(client, RESPONSE_CODE_404, REASON_PHRASE_404_NotFound, "Not Found");
+        sendHttpResponse(client, RESPONSE_CODE_404, REASON_PHRASE_404_NotFound, "Not Found");
         return;
     }
 
@@ -475,7 +479,7 @@ void process_http_requests()
     // Application request processing
     //--------------------------------------------------
 
-    process_request_uri(client, uri);
+    processRequestURI(client, uri);
 
     if (client.connected())
     {
@@ -487,36 +491,36 @@ void process_http_requests()
 
 //--------------------------------------------------
 // SERVER ERROR HANDLING
-// The handle_server_error function is responsible for sending a 500 Internal Server Error response to the client.
+// The handleServerError function is responsible for sending a 500 Internal Server Error response to the client.
 //--------------------------------------------------
-void handle_server_error(WiFiClient &client, const char *message)
+void handleServerError(WiFiClient &client, const char *message)
 {
-    send_http_response(client, RESPONSE_CODE_500, REASON_PHRASE_500_InternalServerError, message);
+    sendHttpResponse(client, RESPONSE_CODE_500, REASON_PHRASE_500_InternalServerError, message);
 }
 
 //--------------------------------------------------
 // HTTP RESPONSE SENDING
-// The send_http_response function is responsible for sending an HTTP response to the client with the specified status code, reason phrase, and message.
+// The sendHttpResponse function is responsible for sending an HTTP response to the client with the specified status code, reason phrase, and message.
 //--------------------------------------------------
-void send_http_response(WiFiClient &client, int statusCode, const char *reasonPhrase, const char *message)
+void sendHttpResponse(WiFiClient &client, int status_code, const char *reason_phrase, const char *message)
 {
-    static char responseBuffer[1024];
+    static char response_buffer[1024];
 
-    int written = snprintf(responseBuffer, sizeof(responseBuffer), "HTTP/1.1 %d %s", statusCode, reasonPhrase);
+    int written = snprintf(response_buffer, sizeof(response_buffer), "HTTP/1.1 %d %s", status_code, reason_phrase);
 
-    if (written < 0 || written >= sizeof(responseBuffer))
+    if (written < 0 || written >= sizeof(response_buffer))
     {
-        handle_server_error(client, "Unexpected buffer overflow preparing HTTP response.");
+        handleServerError(client, "Unexpected buffer overflow preparing HTTP response.");
         return;
     }
 
-    size_t bodyLength = (message != nullptr) ? strlen(message) : 0;
+    size_t body_length = (message != nullptr) ? strlen(message) : 0;
 
-    client.println(responseBuffer);
+    client.println(response_buffer);
     client.println("Content-Type: text/plain");
 
     client.print("Content-Length: ");
-    client.println(bodyLength);
+    client.println(body_length);
 
     client.println("Connection: close");
     client.println();
@@ -532,13 +536,13 @@ void send_http_response(WiFiClient &client, int statusCode, const char *reasonPh
 
 //--------------------------------------------------
 // NETWORK TRANSITION
-// The handle_network_transition function is responsible for switching the network mode between Access Point (AP) and Station (STA) modes.
-// The function takes a boolean parameter 'makeAP' to determine whether to switch to Access Point mode or Station mode.
+// The handleNetworkTransition function is responsible for switching the network mode between Access Point (AP) and Station (STA) modes.
+// The function takes a boolean parameter 'make_AP' to determine whether to switch to Access Point mode or Station mode.
 // The function also updates the 'g_is_network_initialized' flag to reflect the current network state.
 // The function handles both the AP and STA modes, including establishing the connection, setting up the server, and updating the network state.
 // The function ensures that the network transition is handled gracefully, with appropriate error handling and status reporting.
 //--------------------------------------------------
-void handle_network_transition(bool makeAP)
+void handleNetworkTransition(bool make_AP)
 {
     Serial.println("\n--- Setting Network Mode ---");
 
@@ -548,7 +552,7 @@ void handle_network_transition(bool makeAP)
 
     g_is_network_initialized = false;
 
-    if (makeAP)
+    if (make_AP)
     {
         Serial.println("Mode: Access Point (AP)");
         Serial.print("Firmware version: ");
@@ -561,7 +565,7 @@ void handle_network_transition(bool makeAP)
         delay(2000);
 
         wl_status_t status = (wl_status_t)WiFi.status();
-        dump_wifi_status(status);
+        dumpWifiStatus(status);
 
         if (status == WL_NO_MODULE)
         {
@@ -651,7 +655,7 @@ void handle_network_transition(bool makeAP)
     }
 }
 
-void handleNetworkTransition_new(bool makeAP)
+void handleNetworkTransition_new(bool make_AP)
 {
     Serial.println("\n--- Transitioning Network Mode ---");
 
@@ -661,7 +665,7 @@ void handleNetworkTransition_new(bool makeAP)
 
     g_is_network_initialized = false;
 
-    if (makeAP)
+    if (make_AP)
     {
         Serial.println("Mode: Access Point (AP)");
         if (WiFi.beginAP(ap_ssid, ap_pass) != 0)
@@ -729,9 +733,9 @@ void handleNetworkTransition_new(bool makeAP)
 // TIMER MANAGEMENT
 //--------------------------------------------------
 // HEARTBEAT MANAGEMENT
-// The reset_heartbeat_timer function resets the heartbeat timer, indicating that the system is active.
+// The resetHeartbeatTimer function resets the heartbeat timer, indicating that the system is active.
 //--------------------------------------------------
-void reset_heartbeat_timer()
+void resetHeartbeatTimer()
 {
     g_last_update_millis = millis();
 
@@ -741,22 +745,22 @@ void reset_heartbeat_timer()
 
         Serial.println("Heartbeat restored");
 
-        clear_timeout_indication();
+        clearTimeoutIndication();
     }
 }
 
 //--------------------------------------------------
-// The process_timeout function is responsible for handling the heartbeat timeout.
+// The processTimeout function is responsible for handling the heartbeat timeout.
 // It checks if the time since the last update has exceeded the heartbeat timeout and triggers the appropriate actions if necessary.
 //--------------------------------------------------
-void process_timeout()
+void processTimeout()
 {
     // Check if the heartbeat timeout has been reached, even if we are already in a timeout state.
     if (millis() - g_last_update_millis >= HEARTBEAT_TIMEOUT_MS)
     {
         g_timeout_is_active = true;
         g_last_update_millis = millis();
-        handle_timeout();
+        handleTimeout();
     }
 }
 
@@ -764,17 +768,17 @@ void process_timeout()
 // AUDIO
 //--------------------------------------------------
 // AUDIO MANAGEMENT
-// The start_tone_for function initiates a tone sequence on the specified pin with the given frequencies and durations.
-// The process_alert_tone function handles the progression of the tone sequence, switching between segments and stopping the tone when the total duration is reached.
+// The startToneFor function initiates a tone sequence on the specified pin with the given frequencies and durations.
+// The processAlertTone function handles the progression of the tone sequence, switching between segments and stopping the tone when the total duration is reached.
 //--------------------------------------------------
-void start_tone_for(uint8_t tonePin, unsigned int frequency1, unsigned int frequency2, unsigned long segmentDurationMs, unsigned long durationMs)
+void startToneFor(uint8_t tone_pin, unsigned int frequency1, unsigned int frequency2, unsigned long segment_duration_millis, unsigned long duration_millis)
 {
     g_tone_frequency_01 = frequency1;
     g_tone_frequency_02 = frequency2;
 
-    g_tone_segment_duration = segmentDurationMs;
+    g_tone_segment_duration = segment_duration_millis;
 
-    g_tone_duration = durationMs;
+    g_tone_duration = duration_millis;
     g_tone_start_time = millis();
     g_tone_last_segment_change = g_tone_start_time;
 
@@ -783,20 +787,20 @@ void start_tone_for(uint8_t tonePin, unsigned int frequency1, unsigned int frequ
 
     if (frequency1 > 0)
     {
-        tone(tonePin, frequency1);
+        tone(tone_pin, frequency1);
     }
     else
     {
-        noTone(tonePin);
+        noTone(tone_pin);
     }
 }
 
 //--------------------------------------------------
 // AUDIO PROCESSING
-// The process_alert_tone function is responsible for managing the audio output, including switching between tone segments and stopping the tone when the total duration is reached.
+// The processAlertTone function is responsible for managing the audio output, including switching between tone segments and stopping the tone when the total duration is reached.
 // It should be called regularly in the main loop to ensure the audio sequence progresses correctly.
 //--------------------------------------------------
-void process_alert_tone(uint8_t tonePin)
+void processAlertTone(uint8_t tone_pin)
 {
     if (!g_alert_tone_is_active)
     {
@@ -813,7 +817,7 @@ void process_alert_tone(uint8_t tonePin)
     if ((g_tone_duration > 0) &&
         (now - g_tone_start_time >= g_tone_duration))
     {
-        force_quit_tone(tonePin);
+        forceQuitTone(tone_pin);
         return;
     }
 
@@ -831,22 +835,22 @@ void process_alert_tone(uint8_t tonePin)
         {
             if (g_tone_frequency_01 > 0)
             {
-                tone(tonePin, g_tone_frequency_01);
+                tone(tone_pin, g_tone_frequency_01);
             }
             else
             {
-                noTone(tonePin);
+                noTone(tone_pin);
             }
         }
         else
         {
             if (g_tone_frequency_02 > 0)
             {
-                tone(tonePin, g_tone_frequency_02);
+                tone(tone_pin, g_tone_frequency_02);
             }
             else
             {
-                noTone(tonePin);
+                noTone(tone_pin);
             }
         }
     }
@@ -854,10 +858,10 @@ void process_alert_tone(uint8_t tonePin)
 
 //--------------------------------------------------
 // FORCE QUIT TONE
-// The force_quit_tone function is responsible for immediately stopping the tone and resetting the audio state.
+// The forceQuitTone function is responsible for immediately stopping the tone and resetting the audio state.
 // It ensures that the speaker is turned off and all relevant variables are cleared.
 //--------------------------------------------------
-void force_quit_tone(uint8_t tonePin)
+void forceQuitTone(uint8_t tone_pin)
 {
     g_alert_tone_is_active = false;
 
@@ -872,7 +876,7 @@ void force_quit_tone(uint8_t tonePin)
 
     g_tone_playing_first_segment = true;
 
-    noTone(tonePin);
+    noTone(tone_pin);
 
     Serial.println("Speaker OFF");
 }
@@ -881,40 +885,40 @@ void force_quit_tone(uint8_t tonePin)
 // ALERT PROCESSING
 //--------------------------------------------------
 // ALERT TRIPPED
-// The handle_alert_tripped function is responsible for managing the alert tripped event by printing an "ALERT TRIPPED" message to the serial output.
-// It updates the switch and alarm states, starts a tone on the specified speaker pin, and calls the display_alert_tripped function to update the display.
+// The handleAlertTripped function is responsible for managing the alert tripped event by printing an "ALERT TRIPPED" message to the serial output.
+// It updates the switch and alarm states, starts a tone on the specified speaker pin, and calls the displayAlertTripped function to update the display.
 //--------------------------------------------------
-void handle_alert_tripped()
+void handleAlertTripped()
 {
     Serial.println("ALERT TRIPPED");
 
-    currentState = TRIPPED;
+    g_last_reported_trap_state = TRIPPED;
     g_switch_is_open = true;
     g_alarm_is_active = true;
 
-    start_tone_for(SPEAKER_PIN,TONE_A4, TONE_A5, 300, 0);
+    startToneFor(SPEAKER_PIN,TONE_A4, TONE_A5, 300, 0);
 
-    display_alert_tripped();
+    displayAlertTripped();
 }
 
 //--------------------------------------------------
 // ALERT SET
-// The handle_alert_set function is responsible for managing the alert set event by printing an "ALERT SET" message to the serial output.
-// It updates the switch and alarm states, stops any active alert tone, and calls the display_set function to update the display.
+// The handleAlertSet function is responsible for managing the alert set event by printing an "ALERT SET" message to the serial output.
+// It updates the switch and alarm states, stops any active alert tone, and calls the displaySet function to update the display.
 //--------------------------------------------------
-void handle_alert_set()
+void handleAlertSet()
 {
     Serial.println("ALERT SET");
 
-    currentState = SET;
+    g_last_reported_trap_state = SET;
     g_switch_is_open = false;
     g_alarm_is_active = false;
 
     if (g_alert_tone_is_active)
     {
-        force_quit_tone(SPEAKER_PIN);
+        forceQuitTone(SPEAKER_PIN);
     }
-    display_set();
+    displaySet();
 }
 
 //--------------------------------------------------
@@ -923,84 +927,84 @@ void handle_alert_set()
 
 //--------------------------------------------------
 // STATUS TRIPPED
-// The handle_status_tripped function is responsible for managing the status tripped event by printing a "STATUS TRIPPED" message to the serial output.
-// It updates the switch state, starts a tone on the specified speaker pin, and calls the display_tripped function to update the display.
+// The handleStatusTripped function is responsible for managing the status tripped event by printing a "STATUS TRIPPED" message to the serial output.
+// It updates the switch state, starts a tone on the specified speaker pin, and calls the displayTripped function to update the display.
 //--------------------------------------------------
-void handle_status_tripped()
+void handleStatusTripped()
 {
     Serial.println("STATUS TRIPPED");
 
-    currentState = TRIPPED;
+    g_last_reported_trap_state = TRIPPED;
     g_switch_is_open = true;
 
-    start_tone_for(SPEAKER_PIN, TONE_A4, TONE_A5, 300, 0);
+    startToneFor(SPEAKER_PIN, TONE_A4, TONE_A5, 300, 0);
 
-    display_tripped();
+    displayTripped();
 }
 
 
 //--------------------------------------------------
 // STATUS SET
-// The handle_status_set function is responsible for managing the status set event by printing a "STATUS SET" message to the serial output.
-// It updates the switch and alarm states, stops any active alert tone, and calls the display_set function to update the display.
+// The handleStatusSet function is responsible for managing the status set event by printing a "STATUS SET" message to the serial output.
+// It updates the switch and alarm states, stops any active alert tone, and calls the displaySet function to update the display.
 //--------------------------------------------------
-void handle_status_set()
+void handleStatusSet()
 {
     Serial.println("STATUS SET");
 
-    currentState = SET;
+    g_last_reported_trap_state = SET;
     g_switch_is_open = false;
     g_alarm_is_active = false;
 
     if (g_alert_tone_is_active)
     {
-        force_quit_tone(SPEAKER_PIN);
+        forceQuitTone(SPEAKER_PIN);
     }
-    display_set();
+    displaySet();
 }
 
 //--------------------------------------------------
 // TIMEOUT
-// The handle_timeout function is responsible for managing timeout events by printing a "HEARTBEAT TIMEOUT" message to the serial output.
-// If an alarm is not active, it initiates a tone on a specified speaker pin and subsequently calls the display_timeout function to update the display.
+// The handleTimeout function is responsible for managing timeout events by printing a "HEARTBEAT TIMEOUT" message to the serial output.
+// If an alarm is not active, it initiates a tone on a specified speaker pin and subsequently calls the displayTimeout function to update the display.
 //--------------------------------------------------
-void handle_timeout()
+void handleTimeout()
 {
     Serial.println("HEARTBEAT TIMEOUT");
 
-    switch (currentState)
+    switch (g_last_reported_trap_state)
     {
         case TRIPPED:
         case TRIPPED_TIMEOUT:
-            currentState = TRIPPED_TIMEOUT;
+            g_last_reported_trap_state = TRIPPED_TIMEOUT;
             break;
         case SET:
         case SET_TIMEOUT:
-            currentState = SET_TIMEOUT;
+            g_last_reported_trap_state = SET_TIMEOUT;
             break;
         default:
-            currentState = TIMEOUT;
+            g_last_reported_trap_state = TIMEOUT;
             break;
     }
 
     if (!g_alarm_is_active)
     {
-        start_tone_for(SPEAKER_PIN, TONE_A3, 0, 300, TIMEOUT_TONE_DURATION_MS);
+        startToneFor(SPEAKER_PIN, TONE_A3, 0, 300, TIMEOUT_TONE_DURATION_MS);
     }
 
-    display_timeout();
+    displayTimeout();
 }
 
 //--------------------------------------------------
 // Function to display text on the LED matrix
-// The display_text function is responsible for rendering text on the LED matrix display.
+// The displayMatrixText function is responsible for rendering text on the LED matrix display.
 // Parameters:
 //   matrix - The LED matrix object on which to display the text.
 //   text   - The text to be displayed.
 // Returns:
 //   None.
 //--------------------------------------------------
-void display_text(ArduinoLEDMatrix &matrix, const char *text)
+void displayMatrixText(ArduinoLEDMatrix &matrix, const char *text)
 {
     // Begin drawing on the LED matrix
     matrix.beginDraw();
@@ -1026,10 +1030,10 @@ void display_text(ArduinoLEDMatrix &matrix, const char *text)
 
 //--------------------------------------------------
 // DISPLAY TRIPPED
-// The display_tripped function is responsible for updating the LED matrix display to indicate that the status is tripped.
+// The displayTripped function is responsible for updating the LED matrix display to indicate that the status is tripped.
 // It loads the appropriate sequence based on whether the device is in AP mode or not and plays the sequence.
 //--------------------------------------------------
-void display_tripped()
+void displayTripped()
 {
     Serial.println("Display Tripped Status");
     if (g_is_AP_mode)
@@ -1045,10 +1049,10 @@ void display_tripped()
 
 //--------------------------------------------------
 // DISPLAY SET
-// The display_set function is responsible for updating the LED matrix display to indicate that the status is set.
+// The displaySet function is responsible for updating the LED matrix display to indicate that the status is set.
 // It loads the appropriate sequence based on whether the device is in AP mode or not and plays the sequence.
 //--------------------------------------------------
-void display_set()
+void displaySet()
 {
     Serial.println("Display Set Status");
     if (g_is_AP_mode)
@@ -1064,10 +1068,10 @@ void display_set()
 
 //--------------------------------------------------
 // DISPLAY ALERT TRIPPED
-// The display_alert_tripped function is responsible for updating the LED matrix display to indicate that an alert has been tripped.
+// The displayAlertTripped function is responsible for updating the LED matrix display to indicate that an alert has been tripped.
 // It loads the appropriate sequence based on whether the device is in AP mode or not and plays the sequence.
 //--------------------------------------------------
-void display_alert_tripped()
+void displayAlertTripped()
 {
     Serial.println("Display Tripped Alert");
     if (g_is_AP_mode)
@@ -1083,10 +1087,10 @@ void display_alert_tripped()
 
 //--------------------------------------------------
 // DISPLAY TIMEOUT
-// The display_timeout function is responsible for updating the LED matrix display to indicate that a timeout has occurred.
+// The displayTimeout function is responsible for updating the LED matrix display to indicate that a timeout has occurred.
 // It loads the appropriate sequence based on whether the device is in AP mode or not and plays the sequence.
 //--------------------------------------------------
-void display_timeout()
+void displayTimeout()
 {
     Serial.println("Display timeout");
     if (g_is_AP_mode)
@@ -1102,10 +1106,10 @@ void display_timeout()
 
 //--------------------------------------------------
 // CLEAR TIMEOUT INDICATION
-// The clear_timeout_indication function is responsible for clearing the timeout indication on the LED matrix display.
+// The clearTimeoutIndication function is responsible for clearing the timeout indication on the LED matrix display.
 // It loads the appropriate sequence based on whether the device is in AP mode or not and plays the sequence.
 //--------------------------------------------------
-void clear_timeout_indication()
+void clearTimeoutIndication()
 {
     Serial.println("Clear timeout indication");
     #if false
@@ -1123,9 +1127,9 @@ void clear_timeout_indication()
 
 //--------------------------------------------------
 // WIFI STATUS TO STRING
-// The wifi_status_to_string function converts a WiFi status code to a human-readable string.
+// The wifiStatusToString function converts a WiFi status code to a human-readable string.
 //--------------------------------------------------
-const char *wifi_status_to_string(wl_status_t status)
+const char *wifiStatusToString(wl_status_t status)
 {
     switch (status)
     {
@@ -1158,9 +1162,9 @@ const char *wifi_status_to_string(wl_status_t status)
 
 //--------------------------------------------------
 // CURRENT STATE TO STRING
-// The current_state_to_string function converts a current state code to a human-readable string.
+// The currentTrapStateToString function converts a current state code to a human-readable string.
 //--------------------------------------------------
-const char *current_state_to_string(currentState_t state)
+const char *currentTrapStateToString(CurrentState state)
 {
     switch (state)
     {
@@ -1183,18 +1187,18 @@ const char *current_state_to_string(currentState_t state)
 
 //--------------------------------------------------
 // DUMP WIFI STATUS
-// The dump_wifi_status function prints the current WiFi status to the serial monitor.
+// The dumpWifiStatus function prints the current WiFi status to the serial monitor.
 //--------------------------------------------------
-void dump_wifi_status(wl_status_t status)
+void dumpWifiStatus(wl_status_t status)
 {
     Serial.print("WiFi.status() = ");
     Serial.print((int)status);
     Serial.print(" (");
-    Serial.print(wifi_status_to_string(status));
+    Serial.print(wifiStatusToString(status));
     Serial.println(")");
 }
 
-void update_rssi_stats(long rssi)
+void updateRssiStats(long rssi)
 {
     g_rssi_latest = rssi;
 
@@ -1211,7 +1215,12 @@ void update_rssi_stats(long rssi)
     }
 }
 
-bool parse_long(const char *str, long *result)
+//-------------------------------------------------------------
+// The parseLong function attempts to convert a string to a long integer, storing the result in the provided pointer.
+// It returns true if the conversion is successful and valid, and false if the input string is empty, contains invalid
+// characters, or results in an overflow or underflow.
+//-------------------------------------------------------------
+bool parseLong(const char *str, long *result)
 {
     char *endptr;
 
