@@ -8,6 +8,7 @@
 #include "animations.h"
 #include "main.h"
 #include "secrets.h"
+#include <RTC.h> // UNO R4 built-in RTC
 
 //--------------------------------------------------
 // CONFIGURATION
@@ -30,6 +31,11 @@
 const int WIFI_MODE_TEST_PIN = 7; // Pin that will set the level
 const int WIFI_MODE_PIN = 8;
 const int SPEAKER_PIN = 11;
+
+const int DHCP_COMPLETE_ATTEMPTS = 200;
+const int DHCP_COMPLETE_DELAY_MS = 50;
+const int WIFI_CONNECT_ATTEMPTS = 200;
+const int WIFI_CONNECT_DELAY_MS = 50;
 
 const unsigned long NETWORK_CHECK_INTERVAL_MS = 10000UL;
 const unsigned long HEARTBEAT_TIMEOUT_MS      = 450000UL;   // 7.5 minutes
@@ -63,13 +69,12 @@ const int RESPONSE_CODE_404 = 404;
 
 ArduinoLEDMatrix g_matrix;
 WiFiUDP g_udp;
-// MDNS mdns(g_udp);
 WiFiServer g_server(80);
 
 CurrentState g_last_reported_trap_state = NONE;
 unsigned long g_last_network_check_time = 0;
 
-bool g_is_AP_mode = false;
+bool g_use_AP_mode = false;
 bool g_is_network_initialized = false;
 
 unsigned long g_last_update_millis = 0;
@@ -79,6 +84,7 @@ bool g_alarm_is_active = false;
 bool g_timeout_is_active = false;
 
 bool g_alert_tone_is_active = false;
+bool g_tone_playing_first_segment = true;
 unsigned long g_tone_stop_time = 0;
 unsigned long g_tone_start_time = 0;
 unsigned long g_tone_duration = 0;
@@ -92,7 +98,18 @@ long g_rssi_min = LONG_MAX;
 long g_rssi_max = LONG_MIN;
 long g_rssi_latest = 0;
 
-bool g_tone_playing_first_segment = true;
+// RTC / NTP related
+RTCTime g_last_set_time = {0};
+RTCTime g_last_tripped_time = {0};
+RTCTime g_last_heartbeat_time = {0};
+long g_last_rtc_sync_date = -1; // stored as YYYYMMDD, day of year of last successful NTP sync
+bool g_rtc_valid = false;
+
+// DST-check cache
+int g_DST_Mar_Year = -1;
+int g_DST_Nov_Year = -1;
+int g_DST_Mar_2ndSunday = 0;
+int g_DST_Nov_1stSunday = 0;
 
 //--------------------------------------------------
 // SETUP
@@ -100,6 +117,9 @@ bool g_tone_playing_first_segment = true;
 void setup()
 {
     Serial.begin(115200);
+
+    //-----------------------------------------------
+    // Wait 2 second for the Serial to be established
 
     unsigned long startSerialTime = millis();
     while (!Serial && millis() - startSerialTime < 2000)
@@ -109,21 +129,36 @@ void setup()
     }
     digitalWrite(LED_BUILTIN, LOW);
 
-    // Set pin 7 as output and Enable internal pull-up on pin 8 (INPUT_PULLUP)
+    // Set pin WIFI_MODE_TEST_PIN as output and Enable INPUT_PULLUP on pin WIFI_MODE_PIN.
+    // Drop WIFI_MODE_TEST_PIN low and check WIFI_MODE_TEST_PIN to see if they're jumpered.
     pinMode(WIFI_MODE_TEST_PIN, OUTPUT);
     pinMode(WIFI_MODE_PIN, INPUT_PULLUP);
+    digitalWrite(WIFI_MODE_TEST_PIN, LOW);
+    delay(5);
+    g_use_AP_mode = (digitalRead(WIFI_MODE_PIN) == HIGH);
 
     g_matrix.begin();
     g_matrix.loadSequence(STARTUP);
     g_matrix.play(true);
 
-    digitalWrite(WIFI_MODE_TEST_PIN, LOW);
-    delay(5);
-    g_is_AP_mode = (digitalRead(WIFI_MODE_PIN) == HIGH);
+    RTC.begin(); // initialize the built-in RTC
+
 
     Serial.println("System Initializing...");
 
-    handleNetworkTransition(g_is_AP_mode);
+    // Always start with a temporary STA connection to sync RTC via NTP
+    Serial.println("Performing initial NTP sync...");
+    g_is_network_initialized = handleNetworkTransition(false); // force STA
+    if (g_is_network_initialized)
+    {
+        syncRtcFromNtp();
+    }
+
+    // Now switch to operating in AP mode (if indicated by pin WIFI_MODE_PIN)
+    if (g_use_AP_mode)
+    {
+        g_is_network_initialized = handleNetworkTransition(g_use_AP_mode);
+    }
     g_last_update_millis = millis();
 }
 
@@ -138,6 +173,7 @@ void loop()
     processHttpRequests();
     processTimeout();
     processAlertTone(SPEAKER_PIN);
+    processRtcMaintenance(); // daily noon RTC refresh
 }
 
 //--------------------------------------------------
@@ -148,7 +184,6 @@ void loop()
 //--------------------------------------------------
 void processNetworkHealth()
 {
-    // mdns.run();
     if (millis() - g_last_network_check_time < NETWORK_CHECK_INTERVAL_MS)
     {
         return;
@@ -156,32 +191,39 @@ void processNetworkHealth()
 
     g_last_network_check_time = millis();
 
+    bool resetNetwork = false;
+
     if (!g_is_network_initialized)
     {
         Serial.println("Network not initialized. Retrying...");
-        handleNetworkTransition(g_is_AP_mode);
-        return;
-    }
-
-    uint8_t status = WiFi.status();
-    if (g_is_AP_mode)
-    {
-        if (status != WL_AP_LISTENING && status != WL_AP_CONNECTED)
-        {
-            Serial.print("AP ");
-            dumpWifiStatus((wl_status_t)status);
-
-            Serial.println("AP lost. Restarting...");
-            handleNetworkTransition(true);
-        }
+        resetNetwork = true;
     }
     else
     {
-        if (status != WL_CONNECTED)
+        uint8_t status = WiFi.status();
+        if (g_use_AP_mode)
         {
-            Serial.println("STA disconnected. Reconnecting...");
-            handleNetworkTransition(false);
+            if (status != WL_AP_LISTENING && status != WL_AP_CONNECTED)
+            {
+                resetNetwork = true;
+                dumpWifiStatus((wl_status_t)status);
+                Serial.println("AP lost. Restarting...");
+            }
         }
+        else
+        {
+            if (status != WL_CONNECTED)
+            {
+                resetNetwork = true;
+                dumpWifiStatus((wl_status_t)status);
+                Serial.println("STA disconnected. Reconnecting...");
+            }
+        }
+    }
+
+    if (resetNetwork)
+    {
+        g_is_network_initialized = handleNetworkTransition(g_use_AP_mode);
     }
 }
 
@@ -232,10 +274,10 @@ bool getResourceParameter(const char *uri, char *key, char *value, size_t value_
 
 void processRequestURI(WiFiClient &client, const char *uri)
 {
-    static char response_buffer[512];
+    static char response_buffer[1024];
     char client_IP_address[16];
 
-                resetHeartbeatTimer();
+//    resetHeartbeatTimer();
 
     strncpy(client_IP_address, client.remoteIP().toString().c_str(), sizeof(client_IP_address));
 
@@ -254,26 +296,56 @@ void processRequestURI(WiFiClient &client, const char *uri)
         // The resetHeartbeatTimer function WILL NOT reset the heartbeat timer after handling the report request.
         //--------------------------------------------------
         int written = -1;
-        if (g_is_AP_mode)
+        char set_str[32] = "never";
+        char tripped_str[32] = "never";
+        char hb_str[32] = "never";
+        if (g_rtc_valid)
+        {
+            if (g_last_set_time.getYear() > 0)
+                snprintf(set_str, sizeof(set_str), "%04d-%02d-%02d %02d:%02d",
+                         g_last_set_time.getYear(),
+                         Month2int(g_last_set_time.getMonth()),
+                         g_last_set_time.getDayOfMonth(),
+                         g_last_set_time.getHour(),
+                         g_last_set_time.getMinutes());
+            if (g_last_tripped_time.getYear() > 0)
+                snprintf(tripped_str, sizeof(tripped_str), "%04d-%02d-%02d %02d:%02d",
+                         g_last_tripped_time.getYear(),
+                         Month2int(g_last_tripped_time.getMonth()),
+                         g_last_tripped_time.getDayOfMonth(),
+                         g_last_tripped_time.getHour(),
+                         g_last_tripped_time.getMinutes());
+            if (g_last_heartbeat_time.getYear() > 0)
+                snprintf(hb_str, sizeof(hb_str), "%04d-%02d-%02d %02d:%02d",
+                         g_last_heartbeat_time.getYear(),
+                         Month2int(g_last_heartbeat_time.getMonth()),
+                         g_last_heartbeat_time.getDayOfMonth(),
+                         g_last_heartbeat_time.getHour(),
+                         g_last_heartbeat_time.getMinutes());
+        }
+
+        if (g_use_AP_mode)
         {
             written = snprintf(response_buffer,
                                sizeof(response_buffer),
-                               "Current State: %s\r\nIP Address: %s\r\nSignal strength (RSSI): N.A.\r\nRemote IP Address: %s\r\nRemote (RSSI) current/min/max: %ld/%ld/%ld dBm",
+                               "Current State: %s\r\nIP Address: %s\r\nSignal strength (RSSI): N.A.\r\nRemote IP Address: %s\r\nRemote (RSSI) current/min/max: %ld/%ld/%ld dBm\r\nLast SET: %s\r\nLast TRIPPED: %s\r\nLast HEARTBEAT: %s",
                                currentTrapStateToString(g_last_reported_trap_state),
                                WiFi.localIP().toString().c_str(),
                                client_IP_address,
-                               g_rssi_latest, g_rssi_min, g_rssi_max);
+                               g_rssi_latest, g_rssi_min, g_rssi_max,
+                               set_str, tripped_str, hb_str);
         }
         else
         {
             written = snprintf(response_buffer,
                                sizeof(response_buffer),
-                               "Current State: %s\r\nIP Address: %s\r\nSignal strength (RSSI): %ld dBm\r\nRemote IP Address: %s\r\nRemote (RSSI) current/min/max: %ld/%ld/%ld dBm",
+                               "Current State: %s\r\nIP Address: %s\r\nSignal strength (RSSI): %ld dBm\r\nRemote IP Address: %s\r\nRemote (RSSI) current/min/max: %ld/%ld/%ld dBm\r\nLast SET: %s\r\nLast TRIPPED: %s\r\nLast HEARTBEAT: %s",
                                currentTrapStateToString(g_last_reported_trap_state),
                                WiFi.localIP().toString().c_str(),
                                WiFi.RSSI(),
                                client_IP_address,
-                               g_rssi_latest, g_rssi_min, g_rssi_max);
+                               g_rssi_latest, g_rssi_min, g_rssi_max,
+                               set_str, tripped_str, hb_str);
         }
 
         if (written < 0 || written >= sizeof(response_buffer))
@@ -323,10 +395,12 @@ void processRequestURI(WiFiClient &client, const char *uri)
             switch (the_incoming_state)
             {
             case TRIPPED:
+                resetHeartbeatTimer();
                 handleStatusTripped();
                 sendHttpResponse(client, RESPONSE_CODE_200, REASON_PHRASE_200_OK, resource_is_status ? "Status Tripped OK" : "Alert Tripped OK");
                 break;
             case SET:
+                resetHeartbeatTimer();
                 handleStatusSet();
                 sendHttpResponse(client, RESPONSE_CODE_200, REASON_PHRASE_200_OK, resource_is_status ?" Status Set OK" : "Alert Set OK");
                 break;
@@ -538,55 +612,64 @@ void sendHttpResponse(WiFiClient &client, int status_code, const char *reason_ph
 // NETWORK TRANSITION
 // The handleNetworkTransition function is responsible for switching the network mode between Access Point (AP) and Station (STA) modes.
 // The function takes a boolean parameter 'make_AP' to determine whether to switch to Access Point mode or Station mode.
-// The function also updates the 'g_is_network_initialized' flag to reflect the current network state.
 // The function handles both the AP and STA modes, including establishing the connection, setting up the server, and updating the network state.
 // The function ensures that the network transition is handled gracefully, with appropriate error handling and status reporting.
 //--------------------------------------------------
-void handleNetworkTransition(bool make_AP)
+bool handleNetworkTransition(bool make_AP)
 {
+    bool is_initialized = false;
+
     Serial.println("\n--- Setting Network Mode ---");
 
-    // 1. Cleanup existing state to prevent memory leaks and conflicts
+    // Clean up previous state
+    g_server.end(); // stop accepting new clients
     WiFi.disconnect();
-    // server.stop(); // If your server library supports a stop method
-
-    g_is_network_initialized = false;
 
     if (make_AP)
     {
         Serial.println("Mode: Access Point (AP)");
         Serial.print("Firmware version: ");
         Serial.println(WiFi.firmwareVersion());
-        int rc = WiFi.beginAP(ap_ssid, ap_pass);
 
+        // Explicitly set the AP IP so the previous STA static config does not carry over
+        WiFi.config(AP_IP, AP_GATEWAY, AP_SUBNET);
+
+        int rc = WiFi.beginAP(ap_ssid, ap_pass);
         Serial.print("beginAP returned: ");
         Serial.println(rc);
 
-        delay(2000);
+        // Poll for AP ready instead of fixed delay
+        int attempts = 0;
+        while (attempts < WIFI_CONNECT_ATTEMPTS)
+        {
+            wl_status_t status = (wl_status_t)WiFi.status();
+            if (status == WL_AP_LISTENING || status == WL_AP_CONNECTED)
+                break;
+            delay(WIFI_CONNECT_DELAY_MS);
+            attempts++;
+        }
 
         wl_status_t status = (wl_status_t)WiFi.status();
         dumpWifiStatus(status);
 
         if (status == WL_NO_MODULE)
-        {
             Serial.println("No WiFi module found!");
-        }
 
+        IPAddress ip = WiFi.localIP();
         Serial.print("IP: ");
-        Serial.println(WiFi.localIP());
+        Serial.println(ip);
 
         if (status == WL_AP_LISTENING || status == WL_AP_CONNECTED)
         {
             Serial.print("AP established. IP address: ");
-            Serial.println(WiFi.localIP());
-
+            Serial.println(ip);
             g_server.begin();
-
-            g_is_network_initialized = true;
+            is_initialized = true;
         }
         else
         {
             Serial.println("Error: Failed to establish Access Point.");
+            g_server.end();
         }
     }
     else
@@ -594,140 +677,60 @@ void handleNetworkTransition(bool make_AP)
         Serial.print("Mode: Station (STA) - Connecting to ");
         Serial.println(sta_ssid);
 
+        // Configure static IP before begin()
+        WiFi.config(STA_STATIC_IP, STA_DNS, STA_GATEWAY, STA_SUBNET);
+
         if (WiFi.begin(sta_ssid, sta_pass))
         {
-            // Wait for connection (with timeout)
             int attempts = 0;
-            while (WiFi.status() != WL_CONNECTED && attempts < 200)
+            while (WiFi.status() != WL_CONNECTED && attempts < WIFI_CONNECT_ATTEMPTS)
             {
-                delay(50);
+                delay(WIFI_CONNECT_DELAY_MS);
                 Serial.print(".");
                 attempts++;
             }
+            Serial.println();
 
             if (WiFi.status() == WL_CONNECTED)
             {
-                IPAddress ip;
-                bool haveValidIP = false;
-
-                for (int i = 0; i < 200; i++)
-                {
-                    ip = WiFi.localIP();
-
-                    if (ip != IPAddress(0, 0, 0, 0))
-                    {
-                        haveValidIP = true;
-                        break;
-                    }
-                    delay(50);
-                }
+                // With a static IP we should already have a valid address
+                IPAddress ip = WiFi.localIP();
+                bool haveValidIP = (ip != IPAddress(0, 0, 0, 0));
 
                 if (haveValidIP)
                 {
-                    Serial.println("\nConnected successfully!");
+                    Serial.println("Connected successfully!");
                     Serial.print("IP Address: ");
                     Serial.println(ip);
-
-                    // print the received signal strength:
-                    long rssi = WiFi.RSSI();
-                    Serial.print("signal strength (RSSI):");
-                    Serial.print(rssi);
+                    Serial.print("signal strength (RSSI): ");
+                    Serial.print(WiFi.RSSI());
                     Serial.println(" dBm");
-                
-                    g_server.begin();
 
-                    g_is_network_initialized = true;
+                    g_server.begin();
+                    is_initialized = true;
                 }
                 else
                 {
-                    Serial.println("\nError: Failed to obtain a valid IP address.");
+                    Serial.println("Error: Failed to obtain a valid IP address.");
+                    g_server.end();
                 }
             }
             else
             {
-                Serial.println("\nError: Failed to connect to WiFi.");
+                Serial.println("Error: Failed to connect to WiFi.");
+                dumpWifiStatus((wl_status_t)WiFi.status());
+                g_server.end();
             }
         }
         else
         {
             Serial.println("Error: WiFi hardware not responding.");
+            g_server.end();
         }
     }
+    return is_initialized;
 }
 
-void handleNetworkTransition_new(bool make_AP)
-{
-    Serial.println("\n--- Transitioning Network Mode ---");
-
-    // 1. Cleanup existing state to prevent memory leaks and conflicts
-    WiFi.disconnect();
-    // server.stop(); // If your server library supports a stop method
-
-    g_is_network_initialized = false;
-
-    if (make_AP)
-    {
-        Serial.println("Mode: Access Point (AP)");
-        if (WiFi.beginAP(ap_ssid, ap_pass) != 0)
-        {
-            Serial.println("Error: beginAP failed to initialize hardware.");
-            return;
-        }
-
-        // Poll for AP status instead of hard delay
-        int attempts = 0;
-        while (WiFi.status() != WL_AP_LISTENING && attempts < 20)
-        {
-            delay(200);
-            attempts++;
-        }
-
-        if (WiFi.status() == WL_AP_LISTENING)
-        {
-            Serial.print("AP established. IP: ");
-            Serial.println(WiFi.localIP());
-            g_is_network_initialized = true;
-        }
-        else
-        {
-            Serial.println("Error: Failed to establish Access Point.");
-        }
-    }
-    else
-    {
-        Serial.print("Mode: Station (STA) - Connecting to ");
-        Serial.println(sta_ssid);
-
-        if (WiFi.begin(sta_ssid, sta_pass))
-        {
-            int attempts = 0;
-            while (WiFi.status() != WL_CONNECTED && attempts < 20)
-            {
-                delay(500);
-                Serial.print(".");
-                attempts++;
-            }
-
-            if (WiFi.status() == WL_CONNECTED)
-            {
-                Serial.println("\nConnected successfully!");
-                Serial.print("IP Address: ");
-                Serial.println(WiFi.localIP());
-                Serial.print("RSSI: ");
-                Serial.println(WiFi.RSSI());
-                g_is_network_initialized = true;
-            }
-            else
-            {
-                Serial.println("\nError: Connection timeout.");
-            }
-        }
-        else
-        {
-            Serial.println("Error: WiFi hardware not responding.");
-        }
-    }
-}
 
 //--------------------------------------------------
 // TIMER MANAGEMENT
@@ -738,14 +741,16 @@ void handleNetworkTransition_new(bool make_AP)
 void resetHeartbeatTimer()
 {
     g_last_update_millis = millis();
+    if (g_rtc_valid)
+    {
+        RTC.getTime(g_last_heartbeat_time);
+    }
 
     if (g_timeout_is_active)
     {
         g_timeout_is_active = false;
 
         Serial.println("Heartbeat restored");
-
-        clearTimeoutIndication();
     }
 }
 
@@ -892,6 +897,10 @@ void handleAlertTripped()
 {
     Serial.println("ALERT TRIPPED");
 
+    if (g_rtc_valid && g_last_reported_trap_state != TRIPPED)
+    {
+        RTC.getTime(g_last_tripped_time);
+    }
     g_last_reported_trap_state = TRIPPED;
     g_switch_is_open = true;
     g_alarm_is_active = true;
@@ -910,6 +919,10 @@ void handleAlertSet()
 {
     Serial.println("ALERT SET");
 
+    if (g_rtc_valid && g_last_reported_trap_state != SET)
+    {
+        RTC.getTime(g_last_set_time);
+    }
     g_last_reported_trap_state = SET;
     g_switch_is_open = false;
     g_alarm_is_active = false;
@@ -934,6 +947,10 @@ void handleStatusTripped()
 {
     Serial.println("STATUS TRIPPED");
 
+    if (g_rtc_valid && g_last_reported_trap_state != TRIPPED)
+    {
+        RTC.getTime(g_last_tripped_time);
+    }
     g_last_reported_trap_state = TRIPPED;
     g_switch_is_open = true;
 
@@ -952,6 +969,10 @@ void handleStatusSet()
 {
     Serial.println("STATUS SET");
 
+    if (g_rtc_valid && g_last_reported_trap_state != SET)
+    {
+        RTC.getTime(g_last_set_time);
+    }
     g_last_reported_trap_state = SET;
     g_switch_is_open = false;
     g_alarm_is_active = false;
@@ -1036,7 +1057,7 @@ void displayMatrixText(ArduinoLEDMatrix &matrix, const char *text)
 void displayTripped()
 {
     Serial.println("Display Tripped Status");
-    if (g_is_AP_mode)
+    if (g_use_AP_mode)
     {
         g_matrix.loadSequence(LIVE_CAUGHT);
     }
@@ -1055,7 +1076,7 @@ void displayTripped()
 void displaySet()
 {
     Serial.println("Display Set Status");
-    if (g_is_AP_mode)
+    if (g_use_AP_mode)
     {
         g_matrix.loadSequence(LIVE_HEARTBEAT);
     }
@@ -1074,7 +1095,7 @@ void displaySet()
 void displayAlertTripped()
 {
     Serial.println("Display Tripped Alert");
-    if (g_is_AP_mode)
+    if (g_use_AP_mode)
     {
         g_matrix.loadSequence(LIVE_CAUGHT);
     }
@@ -1093,7 +1114,7 @@ void displayAlertTripped()
 void displayTimeout()
 {
     Serial.println("Display timeout");
-    if (g_is_AP_mode)
+    if (g_use_AP_mode)
     {
         g_matrix.loadSequence(LIVE_NO_HEARTBEAT);
     }
@@ -1102,27 +1123,6 @@ void displayTimeout()
         g_matrix.loadSequence(DEBUG_NO_HEARTBEAT);
     }
     g_matrix.play(true);
-}
-
-//--------------------------------------------------
-// CLEAR TIMEOUT INDICATION
-// The clearTimeoutIndication function is responsible for clearing the timeout indication on the LED matrix display.
-// It loads the appropriate sequence based on whether the device is in AP mode or not and plays the sequence.
-//--------------------------------------------------
-void clearTimeoutIndication()
-{
-    Serial.println("Clear timeout indication");
-    #if false
-    if (isAPMode)
-    {
-        matrix.loadSequence(LIVE_NO_HEARTBEAT);
-    }
-    else
-    {
-        matrix.loadSequence(DEBUG_NO_HEARTBEAT);
-    }
-    matrix.play(true);
-    #endif
 }
 
 //--------------------------------------------------
@@ -1253,4 +1253,190 @@ bool parseLong(const char *str, long *result)
     }
 
     return true;
+}
+
+// Returns true if the given UTC epoch is inside US Central Daylight Time
+bool isChicagoDST(unsigned long utc_epoch)
+{
+    static const int8_t dst_month[13] = {
+        /*N.A.*/ -1, /*Jan*/ -1, /*Feb*/ -1, /*Mar*/ 0,
+        /*Apr*/ 1, /*May*/ 1, /*Jun*/ 1, /*Jul*/ 1, /*Aug*/ 1,
+        /*Sep*/ 1, /*Oct*/ 1, /*Nov*/ 0, /*Dec*/ -1};
+
+    time_t raw = utc_epoch;
+    struct tm *utc = gmtime(&raw);
+    if (!utc)
+        return false;
+
+    int year = utc->tm_year + 1900;
+    int month = utc->tm_mon + 1; // 1-12
+
+    int8_t month_type = dst_month[month];
+    if (month_type == -1)
+        return false;
+    if (month_type == 1)
+        return true;
+
+    // Transition months only
+    int day = utc->tm_mday;
+    int hour = utc->tm_hour;
+
+    if (month == 3)
+    {
+        if (g_DST_Mar_Year != year)
+        {
+            struct tm mar1 = {0};
+            mar1.tm_year = year - 1900;
+            mar1.tm_mon = 2; // March
+            mar1.tm_mday = 1;
+            mktime(&mar1);
+
+            g_DST_Mar_2ndSunday = (mar1.tm_wday == 0) ? 8 : 14 - mar1.tm_wday;
+            g_DST_Mar_Year = year;
+        }
+
+        if (day > g_DST_Mar_2ndSunday)
+            return true;
+        if (day == g_DST_Mar_2ndSunday && hour >= 8)
+            return true; // 02:00 CST = 08:00 UTC
+        return false;
+    }
+
+    if (month == 11)
+    {
+        if (g_DST_Nov_Year != year)
+        {
+            struct tm nov1 = {0};
+            nov1.tm_year = year - 1900;
+            nov1.tm_mon = 10; // November
+            nov1.tm_mday = 1;
+            mktime(&nov1);
+
+            g_DST_Nov_1stSunday = (nov1.tm_wday == 0) ? 1 : 7 - nov1.tm_wday;
+            g_DST_Nov_Year = year;
+        }
+
+        if (day < g_DST_Nov_1stSunday)
+            return true;
+        if (day == g_DST_Nov_1stSunday && hour < 7)
+            return true; // 02:00 CDT = 07:00 UTC
+        return false;
+    }
+
+    return false; // unreachable
+}
+
+// Returns the correct Chicago offset in seconds (negative)
+long getChicagoOffsetSeconds(unsigned long utc_epoch)
+{
+    return isChicagoDST(utc_epoch) ? -5L * 3600 : -6L * 3600;
+}
+
+//--------------------------------------------------
+// RTC / NTP SUPPORT
+//--------------------------------------------------
+
+long makeDateStamp(const RTCTime &t)
+{
+    return (long)t.getYear() * 10000L + (long)Month2int(t.getMonth()) * 100L + (long)t.getDayOfMonth();
+}
+
+// Simple NTP client using existing g_udp. Returns true on success.
+// Sets RTC to UTC for now (timezone offset can be added later).
+bool syncRtcFromNtp()
+{
+    const int NTP_PACKET_SIZE = 48;
+    const char *ntpServer = "pool.ntp.org";
+    const int ntpPort = 123;
+    byte packetBuffer[NTP_PACKET_SIZE];
+
+    memset(packetBuffer, 0, NTP_PACKET_SIZE);
+    packetBuffer[0] = 0b11100011; // LI, Version, Mode
+    packetBuffer[1] = 0;
+    packetBuffer[2] = 6;
+    packetBuffer[3] = 0xEC;
+
+    g_udp.begin(2390);
+    if (!g_udp.beginPacket(ntpServer, ntpPort))
+    {
+        Serial.println("NTP: beginPacket failed");
+        g_udp.stop();
+        return false;
+    }
+    g_udp.write(packetBuffer, NTP_PACKET_SIZE);
+    if (!g_udp.endPacket())
+    {
+        Serial.println("NTP: endPacket failed");
+        g_udp.stop();
+        return false;
+    }
+
+    unsigned long start = millis();
+    while (millis() - start < 2000)
+    {
+        if (g_udp.parsePacket())
+        {
+            g_udp.read(packetBuffer, NTP_PACKET_SIZE);
+            unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
+            unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
+            unsigned long secsSince1900 = highWord << 16 | lowWord;
+            const unsigned long seventyYears = 2208988800UL;
+            unsigned long epoch = secsSince1900 - seventyYears;
+            
+            long offset = getChicagoOffsetSeconds(epoch);
+            unsigned long localEpoch = epoch + offset;
+
+            RTCTime t(localEpoch); // constructor from Unix time (UTC)
+            RTC.setTime(t);
+            g_rtc_valid = true;
+            g_last_rtc_sync_date = makeDateStamp(t);
+
+            Serial.print("NTP sync OK. UTC epoch: ");
+            Serial.println(epoch);
+            g_udp.stop();
+            return true;
+        }
+        delay(10);
+    }
+    Serial.println("NTP: timeout waiting for reply");
+    g_udp.stop();
+    return false;
+}
+
+
+// Called from loop(). Performs a noon refresh if needed.
+void processRtcMaintenance()
+{
+    if (!g_rtc_valid)
+        return;
+
+    RTCTime now;
+    RTC.getTime(now);
+    int hour = now.getHour();
+
+    // Refresh window: 11:00–13:00, and not already done today
+    if (hour >= 11 && hour <= 13)
+    {
+        long today = makeDateStamp(now);
+        if (today != g_last_rtc_sync_date)
+        {
+            Serial.println("Noon RTC refresh window — syncing...");
+            bool was_AP = g_use_AP_mode;
+            if (was_AP)
+            {
+                g_is_network_initialized = handleNetworkTransition(false); // temporary STA
+            }
+            if (g_is_network_initialized)
+            {
+                if (syncRtcFromNtp())
+                {
+                    Serial.println("RTC refreshed successfully");
+                }
+            }
+            if (was_AP)
+            {
+                g_is_network_initialized = handleNetworkTransition(true); // return to AP
+            }
+        }
+    }
 }
