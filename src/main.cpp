@@ -104,6 +104,7 @@ RTCTime g_last_tripped_time = {0};
 RTCTime g_last_heartbeat_time = {0};
 long g_last_rtc_sync_date = -1; // stored as YYYYMMDD, day of year of last successful NTP sync
 bool g_rtc_valid = false;
+unsigned long g_last_rtc_sync_attempt_ms = 0;
 
 // DST-check cache
 int g_DST_Mar_Year = -1;
@@ -154,6 +155,7 @@ void setup()
         if (syncRtcFromNtp())
         {
             Serial.println("RTC refreshed successfully");
+            g_last_rtc_sync_attempt_ms = millis();
         }
     }
 
@@ -206,7 +208,12 @@ void processNetworkHealth()
         uint8_t status = WiFi.status();
         if (g_use_AP_mode)
         {
-            if (status != WL_AP_LISTENING && status != WL_AP_CONNECTED)
+            if (status == WL_NO_MODULE)
+            {
+                dumpWifiStatus((wl_status_t)status);
+                Serial.println("AP status unavailable; keeping the successfully started AP.");
+            }
+            else if (status != WL_AP_LISTENING && status != WL_AP_CONNECTED)
             {
                 resetNetwork = true;
                 dumpWifiStatus((wl_status_t)status);
@@ -226,12 +233,20 @@ void processNetworkHealth()
 
     if (resetNetwork || !g_rtc_valid)
     {
+        // A healthy RTC does not need NTP just because the operating network needs recovery.
+        if (g_use_AP_mode && g_rtc_valid)
+        {
+            g_is_network_initialized = handleNetworkTransition(true);
+            return;
+        }
+
         g_is_network_initialized = handleNetworkTransition(false); // force STA
-        if (g_is_network_initialized)
+        if (g_is_network_initialized && !g_rtc_valid)
         {
             if (syncRtcFromNtp())
             {
                 Serial.println("RTC refreshed successfully");
+                g_last_rtc_sync_attempt_ms = millis();
             }
         }
 
@@ -639,7 +654,6 @@ bool handleNetworkTransition(bool make_AP)
 
     // Clean up previous state
     g_server.end(); // stop accepting new clients
-    WiFi.disconnect();
 
     if (make_AP)
     {
@@ -650,33 +664,25 @@ bool handleNetworkTransition(bool make_AP)
         // Use the AP IP overload; the three-address overload is for IP, DNS, and gateway.
         WiFi.config(AP_IP);
 
-        int rc = WiFi.beginAP(ap_ssid, ap_pass);
+        uint8_t rc = WiFi.beginAP(ap_ssid, ap_pass);
         Serial.print("beginAP returned: ");
         Serial.println(rc);
 
-        // Poll for AP ready instead of fixed delay
-        int attempts = 0;
-        while (attempts < WIFI_CONNECT_ATTEMPTS)
-        {
-            wl_status_t status = (wl_status_t)WiFi.status();
-            if (status == WL_AP_LISTENING || status == WL_AP_CONNECTED)
-                break;
-            delay(WIFI_CONNECT_DELAY_MS);
-            attempts++;
-        }
-
-        wl_status_t status = (wl_status_t)WiFi.status();
-        dumpWifiStatus(status);
+        wl_status_t status = (wl_status_t)rc;
+        Serial.print("beginAP status: ");
+        Serial.print((int)status);
+        Serial.print(" (");
+        Serial.print(wifiStatusToString(status));
+        Serial.println(")");
 
         if (status == WL_NO_MODULE)
             Serial.println("No WiFi module found!");
 
-        IPAddress ip = WiFi.localIP();
-        Serial.print("IP: ");
-        Serial.println(ip);
-
         if (status == WL_AP_LISTENING || status == WL_AP_CONNECTED)
         {
+            IPAddress ip = WiFi.localIP();
+            Serial.print("IP: ");
+            Serial.println(ip);
             Serial.print("AP established. IP address: ");
             Serial.println(ip);
             g_server.begin();
@@ -1373,13 +1379,16 @@ bool syncRtcFromNtp()
     packetBuffer[3] = 0xEC;
 
     g_udp.begin(2390);
+
     if (!g_udp.beginPacket(ntpServer, ntpPort))
     {
         Serial.println("NTP: beginPacket failed");
         g_udp.stop();
         return false;
     }
+
     g_udp.write(packetBuffer, NTP_PACKET_SIZE);
+
     if (!g_udp.endPacket())
     {
         Serial.println("NTP: endPacket failed");
@@ -1388,41 +1397,134 @@ bool syncRtcFromNtp()
     }
 
     unsigned long start = millis();
+
     while (millis() - start < 2000)
     {
         if (g_udp.parsePacket())
         {
             g_udp.read(packetBuffer, NTP_PACKET_SIZE);
+
             unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
             unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
-            unsigned long secsSince1900 = highWord << 16 | lowWord;
+            unsigned long secsSince1900 = (highWord << 16) | lowWord;
             const unsigned long seventyYears = 2208988800UL;
             unsigned long epoch = secsSince1900 - seventyYears;
-            
             long offset = getChicagoOffsetSeconds(epoch);
-            time_t localEpoch = (time_t) epoch + offset;
+            time_t localEpoch = (time_t)epoch + offset;
 
-            
-            RTCTime t(localEpoch); // constructor from local Unix time
+            //
+            // Capture RTC BEFORE updating it
+            //
+            RTCTime rtcBefore;
+            RTC.getTime(rtcBefore);
+
+            long rtcEpochBefore = (long)rtcBefore.getUnixTime();
+            long driftSeconds = (long)localEpoch - rtcEpochBefore;
+
+            //
+            // Create corrected time
+            //
+            RTCTime t(localEpoch);
+
+            //
+            // Update RTC immediately
+            //
             RTC.setTime(t);
+
+            //
+            // Verify what RTC now contains
+            //
+            RTCTime rtcAfter;
+            RTC.getTime(rtcAfter);
+
             g_rtc_valid = true;
             g_last_rtc_sync_date = makeDateStamp(t);
 
-            Serial.print("NTP sync OK. UTC epoch: ");
+            Serial.println();
+            Serial.println("========== RTC SYNC ==========");
+
+            Serial.print("UTC epoch       : ");
             Serial.println(epoch);
+
+            Serial.print("Local epoch     : ");
+            Serial.println((long)localEpoch);
+
+            Serial.print("RTC before epoch: ");
+            Serial.println(rtcEpochBefore);
+
+            Serial.print("Drift (seconds) : ");
+            Serial.println(driftSeconds);
+
+            Serial.print("Drift (minutes) : ");
+            Serial.println((double)driftSeconds / 60.0, 3);
+
+            Serial.print("RTC after epoch : ");
+            Serial.println((long)rtcAfter.getUnixTime());
+
+            Serial.println("==============================");
+            Serial.println();
+
             g_udp.stop();
             return true;
         }
+
         delay(10);
     }
+
     Serial.println("NTP: timeout waiting for reply");
     g_udp.stop();
     return false;
 }
 
-
 // Called from loop(). Performs a noon refresh if needed.
 void processRtcMaintenance()
+{
+    if (!g_rtc_valid)
+        return;
+
+    const unsigned long SYNC_INTERVAL_MS = 15UL * 60UL * 1000UL; // 15 mins. or 1/4 hour
+    // 1UL * 60UL * 60UL * 1000UL;                                        // 1 hour
+
+    if (millis() - g_last_rtc_sync_attempt_ms < SYNC_INTERVAL_MS)
+        return;
+
+    Serial.println("Periodic RTC refresh (x hour interval)");
+
+    bool was_AP = g_use_AP_mode;
+
+    if (was_AP)
+    {
+        g_is_network_initialized =
+            handleNetworkTransition(false); // temporary STA
+    }
+
+    if (g_is_network_initialized)
+    {
+        if (syncRtcFromNtp())
+        {
+            Serial.println("RTC refreshed successfully");
+        }
+        else
+        {
+            Serial.println("RTC refresh failed");
+        }
+    }
+    else
+    {
+        Serial.println("RTC refresh skipped: failed to connect to STA.");
+    }
+
+    if (was_AP)
+    {
+        g_is_network_initialized =
+            handleNetworkTransition(true); // return to AP
+    }
+
+    // Keep failed attempts from retriggering on every loop iteration.
+    g_last_rtc_sync_attempt_ms = millis();
+}
+
+void processRtcMaintenance_old()
 {
     if (!g_rtc_valid)
         return;
