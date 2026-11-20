@@ -151,7 +151,10 @@ void setup()
     g_is_network_initialized = handleNetworkTransition(false); // force STA
     if (g_is_network_initialized)
     {
-        syncRtcFromNtp();
+        if (syncRtcFromNtp())
+        {
+            Serial.println("RTC refreshed successfully");
+        }
     }
 
     // Now switch to operating in AP mode (if indicated by pin WIFI_MODE_PIN)
@@ -221,9 +224,22 @@ void processNetworkHealth()
         }
     }
 
-    if (resetNetwork)
+    if (resetNetwork || !g_rtc_valid)
     {
-        g_is_network_initialized = handleNetworkTransition(g_use_AP_mode);
+        g_is_network_initialized = handleNetworkTransition(false); // force STA
+        if (g_is_network_initialized)
+        {
+            if (syncRtcFromNtp())
+            {
+                Serial.println("RTC refreshed successfully");
+            }
+        }
+
+        // Now switch to operating in AP mode (if indicated by pin WIFI_MODE_PIN)
+        if (g_use_AP_mode)
+        {
+            g_is_network_initialized = handleNetworkTransition(g_use_AP_mode);
+        }
     }
 }
 
