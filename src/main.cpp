@@ -647,8 +647,8 @@ bool handleNetworkTransition(bool make_AP)
         Serial.print("Firmware version: ");
         Serial.println(WiFi.firmwareVersion());
 
-        // Explicitly set the AP IP so the previous STA static config does not carry over
-        WiFi.config(AP_IP, AP_GATEWAY, AP_SUBNET);
+        // Use the AP IP overload; the three-address overload is for IP, DNS, and gateway.
+        WiFi.config(AP_IP);
 
         int rc = WiFi.beginAP(ap_ssid, ap_pass);
         Serial.print("beginAP returned: ");
@@ -1358,7 +1358,7 @@ long makeDateStamp(const RTCTime &t)
 }
 
 // Simple NTP client using existing g_udp. Returns true on success.
-// Sets RTC to UTC for now (timezone offset can be added later).
+// Sets RTC to local time.
 bool syncRtcFromNtp()
 {
     const int NTP_PACKET_SIZE = 48;
@@ -1400,9 +1400,10 @@ bool syncRtcFromNtp()
             unsigned long epoch = secsSince1900 - seventyYears;
             
             long offset = getChicagoOffsetSeconds(epoch);
-            unsigned long localEpoch = epoch + offset;
+            time_t localEpoch = (time_t) epoch + offset;
 
-            RTCTime t(localEpoch); // constructor from Unix time (UTC)
+            
+            RTCTime t(localEpoch); // constructor from local Unix time
             RTC.setTime(t);
             g_rtc_valid = true;
             g_last_rtc_sync_date = makeDateStamp(t);
