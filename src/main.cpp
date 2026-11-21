@@ -38,7 +38,10 @@ const int WIFI_CONNECT_ATTEMPTS = 200;
 const int WIFI_CONNECT_DELAY_MS = 50;
 
 const unsigned long NETWORK_CHECK_INTERVAL_MS = 10000UL;
+const unsigned long SERVER_FAILURE_WIFI_RESET_INTERVAL_MS = 60000UL;
 const unsigned long HEARTBEAT_TIMEOUT_MS      = 450000UL;   // 7.5 minutes
+const unsigned long RTC_SYNC_MIN_HEARTBEAT_AGE_MS = 30000UL;
+const unsigned long RTC_SYNC_MAX_HEARTBEAT_AGE_MS = 90000UL;
 const unsigned long ALERT_TONE_MS             = 60000UL;    // 60 sec
 const unsigned long TIMEOUT_TONE_DURATION_MS  = 60000UL;    // 60 sec
 const unsigned long CHIRP_MS = 5000UL;                 // 5 sec
@@ -76,8 +79,12 @@ unsigned long g_last_network_check_time = 0;
 
 bool g_use_AP_mode = false;
 bool g_is_network_initialized = false;
+bool g_ap_status_unavailable_reported = false;
+bool g_server_failure_wifi_reset_attempted = false;
+unsigned long g_last_server_failure_wifi_reset_ms = 0;
 
 unsigned long g_last_update_millis = 0;
+unsigned long g_last_heartbeat_received_millis = 0;
 
 bool g_switch_is_open = false;
 bool g_alarm_is_active = false;
@@ -149,14 +156,21 @@ void setup()
 
     // Always start with a temporary STA connection to sync RTC via NTP
     Serial.println("Performing initial NTP sync...");
-    g_is_network_initialized = handleNetworkTransition(false); // force STA
+    g_is_network_initialized = handleNetworkTransition(false, !g_use_AP_mode); // temporary STA
     if (g_is_network_initialized)
     {
         if (syncRtcFromNtp())
         {
             Serial.println("RTC refreshed successfully");
-            g_last_rtc_sync_attempt_ms = millis();
         }
+        else
+        {
+            Serial.println("Initial RTC sync failed; it will be retried later.");
+        }
+    }
+    else
+    {
+        Serial.println("Initial RTC sync skipped: station connection failed.");
     }
 
     // Now switch to operating in AP mode (if indicated by pin WIFI_MODE_PIN)
@@ -164,7 +178,9 @@ void setup()
     {
         g_is_network_initialized = handleNetworkTransition(g_use_AP_mode);
     }
+    g_last_rtc_sync_attempt_ms = millis();
     g_last_update_millis = millis();
+    g_last_heartbeat_received_millis = g_last_update_millis;
 }
 
 //--------------------------------------------------
@@ -178,7 +194,7 @@ void loop()
     processHttpRequests();
     processTimeout();
     processAlertTone(SPEAKER_PIN);
-    processRtcMaintenance(); // daily noon RTC refresh
+    processRtcMaintenance(); // periodic RTC refresh, aligned to a recent heartbeat
 }
 
 //--------------------------------------------------
@@ -210,11 +226,24 @@ void processNetworkHealth()
         {
             if (status == WL_NO_MODULE)
             {
-                dumpWifiStatus((wl_status_t)status);
-                Serial.println("AP status unavailable; keeping the successfully started AP.");
+                if (!g_ap_status_unavailable_reported)
+                {
+                    dumpWifiStatus((wl_status_t)status);
+                    Serial.println("AP status unavailable; keeping the successfully started AP.");
+                    g_ap_status_unavailable_reported = true;
+                }
             }
-            else if (status != WL_AP_LISTENING && status != WL_AP_CONNECTED)
+            else if (status == WL_AP_LISTENING || status == WL_AP_CONNECTED)
             {
+                if (g_ap_status_unavailable_reported)
+                {
+                    Serial.println("AP status reporting recovered.");
+                    g_ap_status_unavailable_reported = false;
+                }
+            }
+            else
+            {
+                g_ap_status_unavailable_reported = false;
                 resetNetwork = true;
                 dumpWifiStatus((wl_status_t)status);
                 Serial.println("AP lost. Restarting...");
@@ -231,30 +260,10 @@ void processNetworkHealth()
         }
     }
 
-    if (resetNetwork || !g_rtc_valid)
+    if (resetNetwork)
     {
-        // A healthy RTC does not need NTP just because the operating network needs recovery.
-        if (g_use_AP_mode && g_rtc_valid)
-        {
-            g_is_network_initialized = handleNetworkTransition(true);
-            return;
-        }
-
-        g_is_network_initialized = handleNetworkTransition(false); // force STA
-        if (g_is_network_initialized && !g_rtc_valid)
-        {
-            if (syncRtcFromNtp())
-            {
-                Serial.println("RTC refreshed successfully");
-                g_last_rtc_sync_attempt_ms = millis();
-            }
-        }
-
-        // Now switch to operating in AP mode (if indicated by pin WIFI_MODE_PIN)
-        if (g_use_AP_mode)
-        {
-            g_is_network_initialized = handleNetworkTransition(g_use_AP_mode);
-        }
+        g_is_network_initialized = handleNetworkTransition(g_use_AP_mode);
+        g_last_network_check_time = millis();
     }
 }
 
@@ -269,11 +278,17 @@ void processNetworkHealth()
 //--------------------------------------------------
 bool getResourceParameter(const char *uri, char *key, char *value, size_t value_size)
 {
+    if (value == nullptr || value_size == 0)
+        return false;
+
+    value[0] = '\0';
+    if (uri == nullptr || key == nullptr)
+        return false;
+
     const char *key_value_ptr = strstr(uri, key);
 
     if (key_value_ptr == NULL)
     {
-        value[0] = '\0';
         return false;
     }
 
@@ -281,10 +296,14 @@ bool getResourceParameter(const char *uri, char *key, char *value, size_t value_
 
     size_t i = 0;
 
-    while (*key_value_ptr &&
-           *key_value_ptr != '&' &&
-           i < value_size - 1)
+    while (*key_value_ptr && *key_value_ptr != '&')
     {
+        if (i == value_size - 1)
+        {
+            value[i] = '\0';
+            return false;
+        }
+
         value[i++] = *key_value_ptr++;
     }
 
@@ -310,7 +329,17 @@ void processRequestURI(WiFiClient &client, const char *uri)
 
 //    resetHeartbeatTimer();
 
-    strncpy(client_IP_address, client.remoteIP().toString().c_str(), sizeof(client_IP_address));
+    IPAddress remote_ip = client.remoteIP();
+    int ip_written = snprintf(client_IP_address, sizeof(client_IP_address), "%u.%u.%u.%u",
+                              (unsigned int)remote_ip[0],
+                              (unsigned int)remote_ip[1],
+                              (unsigned int)remote_ip[2],
+                              (unsigned int)remote_ip[3]);
+    if (ip_written < 0 || ip_written >= (int)sizeof(client_IP_address))
+    {
+        handleServerError(client, "Unable to format remote IP address.");
+        return;
+    }
 
     if (strncasecmp(uri, "/report", 7) == 0)
     {
@@ -330,6 +359,19 @@ void processRequestURI(WiFiClient &client, const char *uri)
         char set_str[32] = "never";
         char tripped_str[32] = "never";
         char hb_str[32] = "never";
+        IPAddress local_ip = WiFi.localIP();
+        char local_IP_address[16];
+        ip_written = snprintf(local_IP_address, sizeof(local_IP_address), "%u.%u.%u.%u",
+                              (unsigned int)local_ip[0],
+                              (unsigned int)local_ip[1],
+                              (unsigned int)local_ip[2],
+                              (unsigned int)local_ip[3]);
+        if (ip_written < 0 || ip_written >= (int)sizeof(local_IP_address))
+        {
+            handleServerError(client, "Unable to format local IP address.");
+            return;
+        }
+
         if (g_rtc_valid)
         {
             if (g_last_set_time.getYear() > 0)
@@ -361,7 +403,7 @@ void processRequestURI(WiFiClient &client, const char *uri)
                                sizeof(response_buffer),
                                "Current State: %s\r\nIP Address: %s\r\nSignal strength (RSSI): N.A.\r\nRemote IP Address: %s\r\nRemote (RSSI) current/min/max: %ld/%ld/%ld dBm\r\nLast SET: %s\r\nLast TRIPPED: %s\r\nLast HEARTBEAT: %s",
                                currentTrapStateToString(g_last_reported_trap_state),
-                               WiFi.localIP().toString().c_str(),
+                               local_IP_address,
                                client_IP_address,
                                g_rssi_latest, g_rssi_min, g_rssi_max,
                                set_str, tripped_str, hb_str);
@@ -372,7 +414,7 @@ void processRequestURI(WiFiClient &client, const char *uri)
                                sizeof(response_buffer),
                                "Current State: %s\r\nIP Address: %s\r\nSignal strength (RSSI): %ld dBm\r\nRemote IP Address: %s\r\nRemote (RSSI) current/min/max: %ld/%ld/%ld dBm\r\nLast SET: %s\r\nLast TRIPPED: %s\r\nLast HEARTBEAT: %s",
                                currentTrapStateToString(g_last_reported_trap_state),
-                               WiFi.localIP().toString().c_str(),
+                               local_IP_address,
                                WiFi.RSSI(),
                                client_IP_address,
                                g_rssi_latest, g_rssi_min, g_rssi_max,
@@ -395,13 +437,18 @@ void processRequestURI(WiFiClient &client, const char *uri)
 
         if (!getResourceParameter(uri, "state=", state, sizeof(state)))
         {
-            Serial.print("Missing state parameter. URI: ");
+            Serial.print("Missing or too-long state parameter. URI: ");
             Serial.println(uri);
-            sendHttpResponse(client, 400, REASON_PHRASE_400_BadRequest, "Missing Status/Alert State");
+            sendHttpResponse(client, 400, REASON_PHRASE_400_BadRequest, "Missing or too-long Status/Alert State");
             return;
         }
 
-        getResourceParameter(uri, "rssi=", rssi, sizeof(rssi));
+        if (!getResourceParameter(uri, "rssi=", rssi, sizeof(rssi)) &&
+            strstr(uri, "rssi=") != nullptr)
+        {
+            Serial.println("RSSI parameter too long.");
+            rssi[0] = '\0';
+        }
 
         if (strlen(rssi) > 0)
         {
@@ -639,18 +686,35 @@ void sendHttpResponse(WiFiClient &client, int status_code, const char *reason_ph
     client.stop();
 }
 
+static void resetWifiModuleAfterServerStartFailure()
+{
+    unsigned long now = millis();
+    if (g_server_failure_wifi_reset_attempted &&
+        now - g_last_server_failure_wifi_reset_ms < SERVER_FAILURE_WIFI_RESET_INTERVAL_MS)
+    {
+        return;
+    }
+
+    g_server_failure_wifi_reset_attempted = true;
+    g_last_server_failure_wifi_reset_ms = now;
+    Serial.println("Resetting WiFi module to clear a stale HTTP server socket.");
+    WiFi.end();
+}
+
 //--------------------------------------------------
 // NETWORK TRANSITION
 // The handleNetworkTransition function is responsible for switching the network mode between Access Point (AP) and Station (STA) modes.
 // The function takes a boolean parameter 'make_AP' to determine whether to switch to Access Point mode or Station mode.
+// The boolean parameter 'start_http_server' ...
 // The function handles both the AP and STA modes, including establishing the connection, setting up the server, and updating the network state.
 // The function ensures that the network transition is handled gracefully, with appropriate error handling and status reporting.
 //--------------------------------------------------
-bool handleNetworkTransition(bool make_AP)
+bool handleNetworkTransition(bool make_AP, bool start_http_server)
 {
     bool is_initialized = false;
 
     Serial.println("\n--- Setting Network Mode ---");
+    g_ap_status_unavailable_reported = false;
 
     // Clean up previous state
     g_server.end(); // stop accepting new clients
@@ -683,10 +747,20 @@ bool handleNetworkTransition(bool make_AP)
             IPAddress ip = WiFi.localIP();
             Serial.print("IP: ");
             Serial.println(ip);
-            Serial.print("AP established. IP address: ");
-            Serial.println(ip);
             g_server.begin();
-            is_initialized = true;
+            if (g_server)
+            {
+                g_server_failure_wifi_reset_attempted = false;
+                Serial.print("AP established. IP address: ");
+                Serial.println(ip);
+                is_initialized = true;
+            }
+            else
+            {
+                Serial.println("Error: Failed to start HTTP server on the AP.");
+                resetWifiModuleAfterServerStartFailure();
+                g_server.end();
+            }
         }
         else
         {
@@ -728,8 +802,25 @@ bool handleNetworkTransition(bool make_AP)
                     Serial.print(WiFi.RSSI());
                     Serial.println(" dBm");
 
-                    g_server.begin();
-                    is_initialized = true;
+                    if (start_http_server)
+                    {
+                        g_server.begin();
+                        if (g_server)
+                        {
+                            g_server_failure_wifi_reset_attempted = false;
+                            is_initialized = true;
+                        }
+                        else
+                        {
+                            Serial.println("Error: Failed to start HTTP server on the station.");
+                            resetWifiModuleAfterServerStartFailure();
+                            g_server.end();
+                        }
+                    }
+                    else
+                    {
+                        is_initialized = true;
+                    }
                 }
                 else
                 {
@@ -763,6 +854,7 @@ bool handleNetworkTransition(bool make_AP)
 void resetHeartbeatTimer()
 {
     g_last_update_millis = millis();
+    g_last_heartbeat_received_millis = g_last_update_millis;
     if (g_rtc_valid)
     {
         RTC.getTime(g_last_heartbeat_time);
@@ -1400,9 +1492,23 @@ bool syncRtcFromNtp()
 
     while (millis() - start < 2000)
     {
-        if (g_udp.parsePacket())
+        int packet_size = g_udp.parsePacket();
+        if (packet_size > 0)
         {
-            g_udp.read(packetBuffer, NTP_PACKET_SIZE);
+            if (packet_size < NTP_PACKET_SIZE)
+            {
+                Serial.println("NTP: response packet too short");
+                while (g_udp.available() > 0)
+                    g_udp.read();
+                continue;
+            }
+
+            int bytes_read = g_udp.read(packetBuffer, sizeof(packetBuffer));
+            if (bytes_read != NTP_PACKET_SIZE)
+            {
+                Serial.println("NTP: incomplete response packet");
+                continue;
+            }
 
             unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
             unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
@@ -1476,26 +1582,30 @@ bool syncRtcFromNtp()
     return false;
 }
 
-// Called from loop(). Performs a noon refresh if needed.
+// Called from loop(). Performs a periodic refresh during a quiet window after a heartbeat.
 void processRtcMaintenance()
 {
-    if (!g_rtc_valid)
-        return;
-
-    const unsigned long SYNC_INTERVAL_MS = 15UL * 60UL * 1000UL; // 15 mins. or 1/4 hour
-    // 1UL * 60UL * 60UL * 1000UL;                                        // 1 hour
+    const unsigned long SYNC_INTERVAL_MS = 23UL * 60UL * 1000UL; // Temporary 23-minute drift-test interval.
 
     if (millis() - g_last_rtc_sync_attempt_ms < SYNC_INTERVAL_MS)
         return;
 
-    Serial.println("Periodic RTC refresh (x hour interval)");
+    const unsigned long heartbeat_age_ms = millis() - g_last_heartbeat_received_millis;
+    if (g_use_AP_mode &&
+        (heartbeat_age_ms < RTC_SYNC_MIN_HEARTBEAT_AGE_MS ||
+         heartbeat_age_ms > RTC_SYNC_MAX_HEARTBEAT_AGE_MS))
+    {
+        return;
+    }
+
+    Serial.println("Periodic RTC refresh (interval reached during heartbeat quiet window)");
 
     bool was_AP = g_use_AP_mode;
 
     if (was_AP)
     {
         g_is_network_initialized =
-            handleNetworkTransition(false); // temporary STA
+            handleNetworkTransition(false, false); // temporary STA without an HTTP listener
     }
 
     if (g_is_network_initialized)
@@ -1524,38 +1634,3 @@ void processRtcMaintenance()
     g_last_rtc_sync_attempt_ms = millis();
 }
 
-void processRtcMaintenance_old()
-{
-    if (!g_rtc_valid)
-        return;
-
-    RTCTime now;
-    RTC.getTime(now);
-    int hour = now.getHour();
-
-    // Refresh window: 11:00–13:00, and not already done today
-    if (hour >= 11 && hour <= 13)
-    {
-        long today = makeDateStamp(now);
-        if (today != g_last_rtc_sync_date)
-        {
-            Serial.println("Noon RTC refresh window — syncing...");
-            bool was_AP = g_use_AP_mode;
-            if (was_AP)
-            {
-                g_is_network_initialized = handleNetworkTransition(false); // temporary STA
-            }
-            if (g_is_network_initialized)
-            {
-                if (syncRtcFromNtp())
-                {
-                    Serial.println("RTC refreshed successfully");
-                }
-            }
-            if (was_AP)
-            {
-                g_is_network_initialized = handleNetworkTransition(true); // return to AP
-            }
-        }
-    }
-}

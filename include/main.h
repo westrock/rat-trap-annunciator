@@ -20,7 +20,7 @@ void processRequestURI(WiFiClient &client, const char *uri);
 void processHttpRequests();
 void handleServerError(WiFiClient &client, const char *message);
 void sendHttpResponse(WiFiClient &client, int statusCode, const char *reasonPhrase, const char *message);
-bool handleNetworkTransition(bool makeAP);
+bool handleNetworkTransition(bool makeAP, bool startHttpServer = true);
 void resetHeartbeatTimer();
 void processTimeout();
 void startToneFor(uint8_t tonePin, unsigned int frequency1, unsigned int frequency2, unsigned long segmentDurationMs, unsigned long durationMs);
