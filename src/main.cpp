@@ -9,6 +9,10 @@
 #include "main.h"
 #include "secrets.h"
 #include <RTC.h> // UNO R4 built-in RTC
+#include <r_rtc.h>
+
+extern rtc_cfg_t rtc_cfg;
+extern rtc_instance_ctrl_t rtc_ctrl;
 
 //--------------------------------------------------
 // CONFIGURATION
@@ -45,6 +49,7 @@ const unsigned long RTC_SYNC_MIN_HEARTBEAT_AGE_MS = 30000UL;
 const unsigned long RTC_SYNC_MAX_HEARTBEAT_AGE_MS = 90000UL;
 const unsigned long SYNC_INTERVAL_MS = 61UL * 60UL * 1000UL; // 61-minute drift-test interval.
 const unsigned long RTC_SYNC_RETRY_INTERVAL_MS = 5UL * 60UL * 1000UL; // One client status interval.
+const uint32_t RTC_LOCO_FREQ_COMPARE_VALUE = 260U; // Calibrated from about 69.9 seconds/hour of RTC gain.
 const unsigned long ALERT_TONE_MS = 60000UL;                // 60 sec
 const unsigned long TIMEOUT_TONE_DURATION_MS  = 60000UL;    // 60 sec
 const unsigned long CHIRP_MS = 5000UL;                 // 5 sec
@@ -115,6 +120,7 @@ RTCTime g_last_tripped_time = {0};
 RTCTime g_last_heartbeat_time = {0};
 long g_last_rtc_sync_date = -1; // stored as YYYYMMDD, day of year of last successful NTP sync
 bool g_rtc_valid = false;
+bool g_rtc_loco_calibration_applied = false;
 unsigned long g_last_rtc_sync_attempt_ms = 0;
 
 // DST-check cache
@@ -152,6 +158,14 @@ void setup()
     g_matrix.begin();
     g_matrix.loadSequence(STARTUP);
     g_matrix.play(true);
+
+    // The Arduino core defaults the LOCO frequency comparison value to 255.
+    // This initial value compensates for the measured RTC gain; syncRtcFromNtp()
+    // explicitly applies it after NTP succeeds, even if the RTC was already running.
+    if (rtc_cfg.clock_source == RTC_CLOCK_SOURCE_LOCO)
+    {
+        rtc_cfg.freq_compare_value_loco = RTC_LOCO_FREQ_COMPARE_VALUE;
+    }
 
     RTC.begin(); // initialize the built-in RTC
 
@@ -1549,6 +1563,24 @@ bool syncRtcFromNtp()
             // Create corrected time
             //
             RTCTime t(localEpoch);
+
+            if (!g_rtc_loco_calibration_applied &&
+                rtc_cfg.clock_source == RTC_CLOCK_SOURCE_LOCO)
+            {
+                rtc_cfg.freq_compare_value_loco = RTC_LOCO_FREQ_COMPARE_VALUE;
+                const fsp_err_t calibration_result = R_RTC_ClockSourceSet(&rtc_ctrl);
+                if (calibration_result == FSP_SUCCESS)
+                {
+                    g_rtc_loco_calibration_applied = true;
+                    Serial.print("RTC LOCO frequency compare applied: ");
+                    Serial.println(RTC_LOCO_FREQ_COMPARE_VALUE);
+                }
+                else
+                {
+                    Serial.print("RTC LOCO calibration failed; FSP error: ");
+                    Serial.println((int)calibration_result);
+                }
+            }
 
             //
             // Update RTC immediately
