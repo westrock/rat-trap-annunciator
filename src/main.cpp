@@ -40,9 +40,12 @@ const int WIFI_CONNECT_DELAY_MS = 50;
 const unsigned long NETWORK_CHECK_INTERVAL_MS = 10000UL;
 const unsigned long SERVER_FAILURE_WIFI_RESET_INTERVAL_MS = 60000UL;
 const unsigned long HEARTBEAT_TIMEOUT_MS      = 450000UL;   // 7.5 minutes
+const unsigned long RTC_SYNC_TIMEOUT_MARGIN_MS = 5UL * 60UL * 1000UL; // Keep sync out of the final 5 minutes before timeout.
 const unsigned long RTC_SYNC_MIN_HEARTBEAT_AGE_MS = 30000UL;
 const unsigned long RTC_SYNC_MAX_HEARTBEAT_AGE_MS = 90000UL;
-const unsigned long ALERT_TONE_MS             = 60000UL;    // 60 sec
+const unsigned long SYNC_INTERVAL_MS = 61UL * 60UL * 1000UL; // 61-minute drift-test interval.
+const unsigned long RTC_SYNC_RETRY_INTERVAL_MS = 5UL * 60UL * 1000UL; // One client status interval.
+const unsigned long ALERT_TONE_MS = 60000UL;                // 60 sec
 const unsigned long TIMEOUT_TONE_DURATION_MS  = 60000UL;    // 60 sec
 const unsigned long CHIRP_MS = 5000UL;                 // 5 sec
 const unsigned int TONE_A3 = 220;
@@ -81,6 +84,7 @@ bool g_use_AP_mode = false;
 bool g_is_network_initialized = false;
 bool g_ap_status_unavailable_reported = false;
 bool g_server_failure_wifi_reset_attempted = false;
+bool g_rtc_sync_timeout_deferred_reported = false; // Also marks a deferred or failed sync awaiting retry.
 unsigned long g_last_server_failure_wifi_reset_ms = 0;
 
 unsigned long g_last_update_millis = 0;
@@ -161,15 +165,18 @@ void setup()
     {
         if (syncRtcFromNtp())
         {
+            g_rtc_sync_timeout_deferred_reported = false;
             Serial.println("RTC refreshed successfully");
         }
         else
         {
+            g_rtc_sync_timeout_deferred_reported = true;
             Serial.println("Initial RTC sync failed; it will be retried later.");
         }
     }
     else
     {
+        g_rtc_sync_timeout_deferred_reported = true;
         Serial.println("Initial RTC sync skipped: station connection failed.");
     }
 
@@ -597,7 +604,18 @@ void processHttpRequests()
 
     if (fields != 2)
     {
-        Serial.println("Malformed HTTP request");
+        static char response_buffer[1024];
+
+        int written = snprintf(response_buffer, sizeof(response_buffer), "Malformed request: <%s>", request_line);
+
+        if (written < 0 || written >= sizeof(response_buffer))
+        {
+            Serial.println("Malformed HTTP request");
+        }
+        else
+        {
+            Serial.println(response_buffer);
+        }
         sendHttpResponse(client, RESPONSE_CODE_400, REASON_PHRASE_400_BadRequest, "Malformed request");
 
         return;
@@ -1582,12 +1600,37 @@ bool syncRtcFromNtp()
     return false;
 }
 
+static bool rtcSyncHasHeartbeatTimeoutMargin()
+{
+    const unsigned long elapsed_since_update_ms = millis() - g_last_update_millis;
+    const unsigned long time_until_timeout_ms =
+        elapsed_since_update_ms < HEARTBEAT_TIMEOUT_MS
+            ? HEARTBEAT_TIMEOUT_MS - elapsed_since_update_ms
+            : 0UL;
+    if (time_until_timeout_ms < RTC_SYNC_TIMEOUT_MARGIN_MS)
+    {
+        if (!g_rtc_sync_timeout_deferred_reported)
+        {
+            Serial.println("RTC refresh deferred: less than 5 minutes remain before heartbeat timeout.");
+            g_rtc_sync_timeout_deferred_reported = true;
+        }
+        return false;
+    }
+
+    return true;
+}
+
 // Called from loop(). Performs a periodic refresh during a quiet window after a heartbeat.
 void processRtcMaintenance()
 {
-    const unsigned long SYNC_INTERVAL_MS = 23UL * 60UL * 1000UL; // Temporary 23-minute drift-test interval.
+    const unsigned long since_last_attempt_ms = millis() - g_last_rtc_sync_attempt_ms;
+    const bool regular_sync_due = since_last_attempt_ms >= SYNC_INTERVAL_MS;
+    const bool retry_due = g_rtc_sync_timeout_deferred_reported &&
+                           since_last_attempt_ms >= RTC_SYNC_RETRY_INTERVAL_MS;
+    if (!regular_sync_due && !retry_due)
+        return;
 
-    if (millis() - g_last_rtc_sync_attempt_ms < SYNC_INTERVAL_MS)
+    if (!rtcSyncHasHeartbeatTimeoutMargin())
         return;
 
     const unsigned long heartbeat_age_ms = millis() - g_last_heartbeat_received_millis;
@@ -1608,20 +1651,23 @@ void processRtcMaintenance()
             handleNetworkTransition(false, false); // temporary STA without an HTTP listener
     }
 
-    if (g_is_network_initialized)
+    if (!g_is_network_initialized)
     {
+        g_rtc_sync_timeout_deferred_reported = true;
+        Serial.println("RTC refresh skipped: failed to connect to STA; retry queued.");
+    }
+    else if (rtcSyncHasHeartbeatTimeoutMargin())
+    {
+        g_rtc_sync_timeout_deferred_reported = false;
         if (syncRtcFromNtp())
         {
             Serial.println("RTC refreshed successfully");
         }
         else
         {
-            Serial.println("RTC refresh failed");
+            g_rtc_sync_timeout_deferred_reported = true;
+            Serial.println("RTC refresh failed; retry queued for the next eligible window.");
         }
-    }
-    else
-    {
-        Serial.println("RTC refresh skipped: failed to connect to STA.");
     }
 
     if (was_AP)
